@@ -1,0 +1,156 @@
+from ayx import Alteryx
+import pandas as pd
+from itertools import combinations
+
+# ==========================================
+# 1. 读取 Alteryx 传入的数据流
+# ==========================================
+df_proposal = Alteryx.read("#1")
+df_payment = Alteryx.read("#2")
+
+# ==========================================
+# 2. 列名规范与预处理
+# ==========================================
+if 'Record' in df_proposal.columns:
+    df_proposal = df_proposal.rename(columns={'Record': 'proposal_key'})
+
+if 'Record' in df_payment.columns:
+    df_payment = df_payment.drop(columns=['Record'])
+
+df_payment_clean = df_payment.dropna(subset=['Client_Name', 'Yesterday_Balance', 'payment_key']).copy()
+df_proposal_clean = df_proposal.dropna(subset=['Buyer Name (Local)', 'Proposal Total Amount', 'proposal_key']).copy()
+
+df_payment_clean['amount_cents'] = df_payment_clean['Yesterday_Balance'].apply(lambda x: int(round(x * 100)))
+df_proposal_clean['amount_cents'] = df_proposal_clean['Proposal Total Amount'].apply(lambda x: int(round(x * 100)))
+
+match_results = {}
+
+# ==========================================
+# 3. 核心多对多组合匹配算法
+# ==========================================
+for client, prop_group in df_proposal_clean.groupby('Buyer Name (Local)'):
+    pay_group = df_payment_clean[df_payment_clean['Client_Name'] == client]
+    
+    if pay_group.empty:
+        continue
+        
+    available_proposals = prop_group[['proposal_key', 'amount_cents']].rename(
+        columns={'proposal_key': 'id', 'amount_cents': 'amount'}
+    ).to_dict('records')
+    
+    # 🌟 修改点：Debtor Agent Name 改为 Debtor_Agent_Name
+    available_payments = pay_group[['payment_key', 'amount_cents', 'Debit Account', 'Debtor_Agent_Name', 'Debtor Agent Party ID']].rename(
+        columns={'payment_key': 'id', 'amount_cents': 'amount'}
+    ).to_dict('records')
+    
+    available_payments.sort(key=lambda x: x['amount'], reverse=True)
+    
+    for num_props in range(1, len(available_proposals) + 1):
+        if not available_proposals or not available_payments:
+            break
+            
+        matched_in_this_level = True
+        while matched_in_this_level:
+            matched_in_this_level = False
+            prop_combos = list(combinations(available_proposals, num_props))
+            
+            for p_combo in prop_combos:
+                if not all(p in available_proposals for p in p_combo):
+                    continue
+                    
+                target = sum(p['amount'] for p in p_combo)
+                
+                valid_subsets = []
+                def find_subsets(curr_idx, current_sum, current_subset):
+                    if current_sum == target:
+                        valid_subsets.append(list(current_subset))
+                        return
+                    if current_sum > target or len(current_subset) >= 10:
+                        return
+                    for i in range(curr_idx, len(available_payments)):
+                        current_subset.append(available_payments[i])
+                        find_subsets(i + 1, current_sum + available_payments[i]['amount'], current_subset)
+                        current_subset.pop()
+                
+                find_subsets(0, 0, [])
+                
+                if valid_subsets:
+                    best_subset = min(valid_subsets, key=len)
+                    
+                    payment_ids_str = ", ".join(str(p['id']) for p in best_subset)
+                    payment_amounts_str = ", ".join(str(p['amount']/100.0) for p in best_subset)
+                    
+                    # 🌟 智能去重拼接逻辑
+                    def format_field(p_list, field_name):
+                        valid_vals = []
+                        for p in p_list:
+                            val = p.get(field_name)
+                            if pd.notna(val):
+                                str_val = str(val).strip()
+                                if str_val and str_val not in valid_vals:
+                                    valid_vals.append(str_val)
+                        return ", ".join(valid_vals) if valid_vals else None
+
+                    debit_account_str = format_field(best_subset, 'Debit Account')
+                    # 🌟 修改点：Debtor Agent Name 改为 Debtor_Agent_Name
+                    debtor_agent_name_str = format_field(best_subset, 'Debtor_Agent_Name')
+                    debtor_agent_party_id_str = format_field(best_subset, 'Debtor Agent Party ID')
+                    
+                    combo_prop_ids_str = ", ".join(str(p['id']) for p in p_combo) if len(p_combo) > 1 else None
+                    
+                    for p in p_combo:
+                        match_results[p['id']] = {
+                            'Matched_Payment_IDs': payment_ids_str,
+                            'Matched_Payment_Amounts': payment_amounts_str,
+                            'Matched_Debit_Account': debit_account_str,
+                            'Matched_Debtor_Agent_Name': debtor_agent_name_str,
+                            'Matched_Debtor_Agent_Party_ID': debtor_agent_party_id_str,
+                            'Group_Matched_Proposals': combo_prop_ids_str,
+                            'Group_Target_Sum': target / 100.0 if len(p_combo) > 1 else None
+                        }
+                    
+                    for p in p_combo:
+                        available_proposals.remove(p)
+                    used_pay_ids = {p['id'] for p in best_subset}
+                    available_payments = [p for p in available_payments if p['id'] not in used_pay_ids]
+                    
+                    matched_in_this_level = True
+                    break
+
+# ==========================================
+# 4. 结果整合与双端口输出
+# ==========================================
+def get_match_val(row, col_name):
+    pid = row['proposal_key']
+    if pd.isna(pid) or pid not in match_results:
+        return None
+    return match_results[pid].get(col_name)
+
+df_proposal['Matched_Payment_IDs'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Payment_IDs'), axis=1)
+df_proposal['Matched_Payment_Amounts'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Payment_Amounts'), axis=1)
+df_proposal['Matched_Debit_Account'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Debit_Account'), axis=1)
+df_proposal['Matched_Debtor_Agent_Name'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Debtor_Agent_Name'), axis=1)
+df_proposal['Matched_Debtor_Agent_Party_ID'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Debtor_Agent_Party_ID'), axis=1)
+df_proposal['Group_Matched_Proposals'] = df_proposal.apply(lambda row: get_match_val(row, 'Group_Matched_Proposals'), axis=1)
+df_proposal['Group_Target_Sum'] = df_proposal.apply(lambda row: get_match_val(row, 'Group_Target_Sum'), axis=1)
+
+
+# --- 新增功能：捞出没被匹配上的 Payment ---
+matched_payment_ids = set()
+for info in match_results.values():
+    ids_str = info.get('Matched_Payment_IDs')
+    if ids_str:
+        for pid in str(ids_str).split(','):
+            matched_payment_ids.add(str(pid).strip())
+
+df_unmatched_payments = df_payment[~df_payment['payment_key'].astype(str).isin(matched_payment_ids)]
+
+
+# ==========================================
+# 5. 写入流出端口
+# ==========================================
+# 端口 1: 带有匹配核销信息的 Proposal 汇总表
+Alteryx.write(df_proposal, 1)
+
+# 端口 2: 剩余未被核销匹配的 Payment 余额表 (保持原表格式)
+Alteryx.write(df_unmatched_payments, 2)
