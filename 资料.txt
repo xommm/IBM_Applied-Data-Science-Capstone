@@ -1,0 +1,133 @@
+from ayx import Alteryx
+import pandas as pd
+from itertools import combinations
+
+# ==========================================
+# 1. 读取 Alteryx 传入的数据流
+# ==========================================
+# 按照你的设置：#1 是 Proposal，#2 是 Payment
+df_proposal = Alteryx.read("#1")
+df_payment = Alteryx.read("#2")
+
+# ==========================================
+# 2. 列名规范与预处理
+# ==========================================
+# Proposal 中的 Record 列改名为 proposal_key
+if 'Record' in df_proposal.columns:
+    df_proposal = df_proposal.rename(columns={'Record': 'proposal_key'})
+
+# Payment 中的 Record 列理论上不存在，只有 payment_key (为防止意外，若有 Record 则删除)
+if 'Record' in df_payment.columns:
+    df_payment = df_payment.drop(columns=['Record'])
+
+# 复制一份干净的数据用于后台复杂运算，保留原始 df_proposal 待会做左连接
+df_payment_clean = df_payment.dropna(subset=['Client_Name', 'Yesterday_Balance', 'payment_key']).copy()
+df_proposal_clean = df_proposal.dropna(subset=['Buyer Name (Local)', 'Proposal Total Amount', 'proposal_key']).copy()
+
+# 转换为美分（整数）进行精确计算，彻底杜绝浮点数误差
+df_payment_clean['amount_cents'] = df_payment_clean['Yesterday_Balance'].apply(lambda x: int(round(x * 100)))
+df_proposal_clean['amount_cents'] = df_proposal_clean['Proposal Total Amount'].apply(lambda x: int(round(x * 100)))
+
+# 核心字典：用来记录每笔 proposal_key 最终匹配到了什么
+match_results = {}
+
+# ==========================================
+# 3. 核心多对多组合匹配算法
+# ==========================================
+# 按客户分组进行后台搜索
+for client, prop_group in df_proposal_clean.groupby('Buyer Name (Local)'):
+    pay_group = df_payment_clean[df_payment_clean['Client_Name'] == client]
+    
+    if pay_group.empty:
+        continue
+        
+    # 提取字典格式以提高遍历速度
+    available_proposals = prop_group[['proposal_key', 'amount_cents']].rename(
+        columns={'proposal_key': 'id', 'amount_cents': 'amount'}
+    ).to_dict('records')
+    
+    available_payments = pay_group[['payment_key', 'amount_cents']].rename(
+        columns={'payment_key': 'id', 'amount_cents': 'amount'}
+    ).to_dict('records')
+    
+    # 优先匹配大额付款
+    available_payments.sort(key=lambda x: x['amount'], reverse=True)
+    
+    # 动态匹配：从 1笔Proposal 试到 全部Proposal
+    for num_props in range(1, len(available_proposals) + 1):
+        if not available_proposals or not available_payments:
+            break
+            
+        matched_in_this_level = True
+        while matched_in_this_level:
+            matched_in_this_level = False
+            # 生成该数量下的所有 Proposal 组合
+            prop_combos = list(combinations(available_proposals, num_props))
+            
+            for p_combo in prop_combos:
+                if not all(p in available_proposals for p in p_combo):
+                    continue
+                    
+                target = sum(p['amount'] for p in p_combo)
+                
+                valid_subsets = []
+                def find_subsets(curr_idx, current_sum, current_subset):
+                    if current_sum == target:
+                        valid_subsets.append(list(current_subset))
+                        return
+                    if current_sum > target or len(current_subset) >= 10:
+                        return
+                    for i in range(curr_idx, len(available_payments)):
+                        current_subset.append(available_payments[i])
+                        find_subsets(i + 1, current_sum + available_payments[i]['amount'], current_subset)
+                        current_subset.pop()
+                
+                find_subsets(0, 0, [])
+                
+                if valid_subsets:
+                    # 取使用 Payment 笔数最少的最优解
+                    best_subset = min(valid_subsets, key=len)
+                    
+                    # 获取匹配到的 payment_key 和金额
+                    payment_ids_str = ", ".join(str(p['id']) for p in best_subset)
+                    payment_amounts_str = ", ".join(str(p['amount']/100.0) for p in best_subset)
+                    
+                    # 如果多笔 Proposal 凑一起匹配，记录兄弟 proposal_key
+                    combo_prop_ids_str = ", ".join(str(p['id']) for p in p_combo) if len(p_combo) > 1 else None
+                    
+                    # 以 proposal_key 为字典索引写入结果
+                    for p in p_combo:
+                        match_results[p['id']] = {
+                            'Matched_Payment_IDs': payment_ids_str,
+                            'Matched_Payment_Amounts': payment_amounts_str,
+                            'Group_Matched_Proposals': combo_prop_ids_str,
+                            'Group_Target_Sum': target / 100.0 if len(p_combo) > 1 else None
+                        }
+                    
+                    # 从池子中剔除已消耗的单据
+                    for p in p_combo:
+                        available_proposals.remove(p)
+                    used_pay_ids = {p['id'] for p in best_subset}
+                    available_payments = [p for p in available_payments if p['id'] not in used_pay_ids]
+                    
+                    # 如果成功匹配了一组，重新在当前层级继续扫描剩余项
+                    matched_in_this_level = True
+                    break
+
+# ==========================================
+# 4. 结果整合与输出 (Left Join 回母表)
+# ==========================================
+def get_match_val(row, col_name):
+    pid = row['proposal_key']
+    if pd.isna(pid) or pid not in match_results:
+        return None
+    return match_results[pid].get(col_name)
+
+# 逐行平铺结果，绝不折叠数据
+df_proposal['Matched_Payment_IDs'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Payment_IDs'), axis=1)
+df_proposal['Matched_Payment_Amounts'] = df_proposal.apply(lambda row: get_match_val(row, 'Matched_Payment_Amounts'), axis=1)
+df_proposal['Group_Matched_Proposals'] = df_proposal.apply(lambda row: get_match_val(row, 'Group_Matched_Proposals'), axis=1)
+df_proposal['Group_Target_Sum'] = df_proposal.apply(lambda row: get_match_val(row, 'Group_Target_Sum'), axis=1)
+
+# 将完整的包含新增核销状态的 Proposal 表格输出到下游接力
+Alteryx.write(df_proposal, 1)
