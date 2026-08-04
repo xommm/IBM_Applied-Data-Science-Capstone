@@ -1,0 +1,337 @@
+from ayx import Alteryx
+import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
+import unicodedata
+import re
+
+
+# ==========================================
+# 1. 读取 Alteryx 输入
+# ==========================================
+# 输入 #1：Discount 表
+# 输入 #2：Proposal 表
+df_discount = Alteryx.read("#1")
+df_proposal = Alteryx.read("#2")
+
+
+# ==========================================
+# 2. 检查必要字段
+# ==========================================
+discount_required_columns = [
+    "Internal Buyer Reference",
+    "Discount Transcation Reference",
+    "Total Invoice Amount",
+    "Buyer Name (Local)"
+]
+
+proposal_required_columns = [
+    "Buyer Name (Local)",
+    "Internal Buyer Reference",
+    "Proposal Reference",
+    "Proposal Total Amount"
+]
+
+missing_discount_columns = [
+    column
+    for column in discount_required_columns
+    if column not in df_discount.columns
+]
+
+missing_proposal_columns = [
+    column
+    for column in proposal_required_columns
+    if column not in df_proposal.columns
+]
+
+if missing_discount_columns:
+    raise ValueError(
+        "Discount 表缺少字段："
+        + ", ".join(missing_discount_columns)
+    )
+
+if missing_proposal_columns:
+    raise ValueError(
+        "Proposal 表缺少字段："
+        + ", ".join(missing_proposal_columns)
+    )
+
+
+# ==========================================
+# 3. 辅助函数
+# ==========================================
+def normalize_buyer_name(value):
+    """
+    标准化 Buyer Name，避免以下差异影响匹配：
+    - 前后空格
+    - 全角/半角
+    - 大小写
+    - 换行或内部空白
+    """
+    if pd.isna(value):
+        return None
+
+    text = unicodedata.normalize("NFKC", str(value))
+    text = text.strip().lower()
+    text = re.sub(r"\s+", "", text)
+
+    return text if text else None
+
+
+def amount_to_cents(value):
+    """
+    将金额转换为整数分，避免浮点数精度问题。
+    """
+    if pd.isna(value):
+        return None
+
+    try:
+        text = str(value).strip().replace(",", "")
+
+        if not text:
+            return None
+
+        amount = Decimal(text).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+
+        return int(amount * 100)
+
+    except Exception:
+        return None
+
+
+def clean_reference(value):
+    """
+    清理 Reference 字段。
+    """
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+
+    return text if text else None
+
+
+# ==========================================
+# 4. 创建工作表及匹配键
+# ==========================================
+discount_work = df_discount.copy()
+proposal_work = df_proposal.copy()
+
+discount_work["_discount_row_id"] = range(len(discount_work))
+proposal_work["_proposal_row_id"] = range(len(proposal_work))
+
+discount_work["_buyer_key"] = (
+    discount_work["Buyer Name (Local)"]
+    .apply(normalize_buyer_name)
+)
+
+proposal_work["_buyer_key"] = (
+    proposal_work["Buyer Name (Local)"]
+    .apply(normalize_buyer_name)
+)
+
+discount_work["_amount_cents"] = (
+    discount_work["Total Invoice Amount"]
+    .apply(amount_to_cents)
+)
+
+proposal_work["_amount_cents"] = (
+    proposal_work["Proposal Total Amount"]
+    .apply(amount_to_cents)
+)
+
+discount_work["_internal_reference_clean"] = (
+    discount_work["Internal Buyer Reference"]
+    .apply(clean_reference)
+)
+
+proposal_work["_internal_reference_clean"] = (
+    proposal_work["Internal Buyer Reference"]
+    .apply(clean_reference)
+)
+
+
+# ==========================================
+# 5. 确定 Proposal 中存在的 Buyer
+# ==========================================
+# 业务规则：
+# 只要 Discount 的 Buyer 出现在 Proposal 中，
+# 该 Discount 就属于能够 settle 的范围。
+proposal_buyer_keys = set(
+    proposal_work["_buyer_key"].dropna().tolist()
+)
+
+eligible_discount = discount_work[
+    discount_work["_buyer_key"].isin(proposal_buyer_keys)
+].copy()
+
+
+# ==========================================
+# 6. 一对一匹配 Buyer + Amount
+# ==========================================
+# cumcount 用于避免重复金额产生笛卡尔积。
+#
+# 例如：
+# Discount 有同 Buyer、同金额 2 条；
+# Proposal 有同 Buyer、同金额 3 条；
+# 则前 2 条一对一合并，第 3 条 Proposal 单独保留。
+eligible_discount["_match_sequence"] = (
+    eligible_discount
+    .groupby(
+        ["_buyer_key", "_amount_cents"],
+        dropna=False
+    )
+    .cumcount()
+)
+
+proposal_work["_match_sequence"] = (
+    proposal_work
+    .groupby(
+        ["_buyer_key", "_amount_cents"],
+        dropna=False
+    )
+    .cumcount()
+)
+
+valid_discount_for_match = eligible_discount[
+    eligible_discount["_buyer_key"].notna()
+    & eligible_discount["_amount_cents"].notna()
+].copy()
+
+valid_proposal_for_match = proposal_work[
+    proposal_work["_buyer_key"].notna()
+    & proposal_work["_amount_cents"].notna()
+].copy()
+
+match_keys = [
+    "_buyer_key",
+    "_amount_cents",
+    "_match_sequence"
+]
+
+matched_pairs = valid_discount_for_match[
+    match_keys
+    + [
+        "_discount_row_id",
+        "_internal_reference_clean",
+        "Discount Transcation Reference",
+        "Total Invoice Amount",
+        "Buyer Name (Local)"
+    ]
+].merge(
+    valid_proposal_for_match[
+        match_keys
+        + [
+            "_proposal_row_id",
+            "_internal_reference_clean",
+            "Proposal Reference",
+            "Proposal Total Amount",
+            "Buyer Name (Local)"
+        ]
+    ],
+    on=match_keys,
+    how="inner",
+    suffixes=("_discount", "_proposal")
+)
+
+matched_discount_row_ids = set(
+    matched_pairs["_discount_row_id"].tolist()
+)
+
+matched_proposal_row_ids = set(
+    matched_pairs["_proposal_row_id"].tolist()
+)
+
+
+# ==========================================
+# 7. 构建最终结果
+# ==========================================
+output_records = []
+
+
+# ------------------------------------------
+# 7.1 Discount 侧记录
+# ------------------------------------------
+# 所有 Buyer 存在于 Proposal 的 Discount 均保留：
+# - 金额匹配上的：代表与 Proposal 合并后的记录
+# - 金额没匹配上：因为有 Discount Reference，也要保留
+for _, row in eligible_discount.iterrows():
+    output_records.append({
+        "Internal Buyer Reference":
+            row["Internal Buyer Reference"],
+
+        "Discount Transcation Reference":
+            row["Discount Transcation Reference"],
+
+        "Total Invoice Amount":
+            row["Total Invoice Amount"],
+
+        "Buyer Name (Local)":
+            row["Buyer Name (Local)"]
+    })
+
+
+# ------------------------------------------
+# 7.2 Proposal 侧未匹配记录
+# ------------------------------------------
+# Proposal 全部都是确定 settle 的。
+# 如果没有找到同 Buyer、同金额的 Discount，则单独补一条。
+#
+# Discount Transcation Reference 留空；
+# Total Invoice Amount 使用 Proposal Total Amount。
+unmatched_proposals = proposal_work[
+    ~proposal_work["_proposal_row_id"].isin(
+        matched_proposal_row_ids
+    )
+].copy()
+
+for _, row in unmatched_proposals.iterrows():
+    output_records.append({
+        "Internal Buyer Reference":
+            row["Internal Buyer Reference"],
+
+        "Discount Transcation Reference":
+            None,
+
+        "Total Invoice Amount":
+            row["Proposal Total Amount"],
+
+        "Buyer Name (Local)":
+            row["Buyer Name (Local)"]
+    })
+
+
+# ==========================================
+# 8. 生成最终 DataFrame
+# ==========================================
+output_columns = [
+    "Internal Buyer Reference",
+    "Discount Transcation Reference",
+    "Total Invoice Amount",
+    "Buyer Name (Local)"
+]
+
+df_output = pd.DataFrame(
+    output_records,
+    columns=output_columns
+)
+
+
+# ==========================================
+# 9. 最终精确去重
+# ==========================================
+# 防止源表本身存在完全重复行。
+# 不会仅按 Buyer + Amount 去重，因为不同 Discount Reference
+# 应当作为不同业务记录保留。
+df_output = df_output.drop_duplicates(
+    subset=output_columns,
+    keep="first"
+).reset_index(drop=True)
+
+
+# ==========================================
+# 10. 写入 Alteryx 输出端口
+# ==========================================
+Alteryx.write(df_output, 1)
