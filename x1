@@ -1,34 +1,43 @@
 from ayx import Alteryx
 import pandas as pd
 
-# 读取输入数据
 df = Alteryx.read("#1")
 
-# 字段检查
 required_columns = ["交易流水号", "信贷借据号"]
-missing_columns = [
-    col for col in required_columns
-    if col not in df.columns
-]
+missing_columns = [c for c in required_columns if c not in df.columns]
 
 if missing_columns:
     raise ValueError("缺少字段：" + ", ".join(missing_columns))
 
-# 判断“信贷借据号”是否为空：包含 Null、空字符串、纯空格
+# 信贷借据号为空：Null、空字符串、纯空格
 loan_no_empty = (
     df["信贷借据号"].isna()
     | df["信贷借据号"].astype(str).str.strip().eq("")
 )
 
-# 标记交易流水号是否重复
+# 交易流水号重复标记
 transaction_duplicated = df["交易流水号"].duplicated(keep=False)
 
-# 删除条件：
-# 交易流水号不唯一 且 信贷借据号为空
-rows_to_remove = transaction_duplicated & loan_no_empty
+# 对“交易流水号重复 + 信贷借据号为空”的记录：
+# 每组保留第一条，其余删除
+empty_loan_rank = (
+    df.loc[loan_no_empty]
+    .groupby("交易流水号", dropna=False)
+    .cumcount()
+)
 
-# 保留其余记录
-df_output = df[~rows_to_remove].copy()
+# 初始化：全部保留
+keep_mask = pd.Series(True, index=df.index)
 
-# 输出
+# 仅删除：交易流水号重复、信贷借据号为空、且该流水号下为空借据号的第2条及以后
+rows_to_remove = (
+    transaction_duplicated
+    & loan_no_empty
+    & empty_loan_rank.reindex(df.index).fillna(0).ge(1)
+)
+
+keep_mask[rows_to_remove] = False
+
+df_output = df[keep_mask].copy()
+
 Alteryx.write(df_output, 1)
