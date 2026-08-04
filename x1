@@ -9,35 +9,51 @@ missing_columns = [c for c in required_columns if c not in df.columns]
 if missing_columns:
     raise ValueError("缺少字段：" + ", ".join(missing_columns))
 
+
 # 信贷借据号为空：Null、空字符串、纯空格
-loan_no_empty = (
+loan_empty = (
     df["信贷借据号"].isna()
     | df["信贷借据号"].astype(str).str.strip().eq("")
 )
 
-# 交易流水号重复标记
-transaction_duplicated = df["交易流水号"].duplicated(keep=False)
+# 交易流水号为空时，不参与重复判断，直接保留
+transaction_valid = (
+    df["交易流水号"].notna()
+    & df["交易流水号"].astype(str).str.strip().ne("")
+)
 
-# 对“交易流水号重复 + 信贷借据号为空”的记录：
-# 每组保留第一条，其余删除
-empty_loan_rank = (
-    df.loc[loan_no_empty]
+# 每个交易流水号是否至少存在一条“信贷借据号非空”的记录
+has_non_empty_loan = (
+    (~loan_empty)
+    .groupby(df["交易流水号"], dropna=False)
+    .transform("any")
+)
+
+# 对于“没有任何非空信贷借据号”的交易流水号组：
+# 空借据号记录仅保留第一条
+empty_loan_sequence = (
+    df.loc[loan_empty & transaction_valid]
     .groupby("交易流水号", dropna=False)
     .cumcount()
+    .reindex(df.index)
+    .fillna(0)
 )
 
-# 初始化：全部保留
-keep_mask = pd.Series(True, index=df.index)
-
-# 仅删除：交易流水号重复、信贷借据号为空、且该流水号下为空借据号的第2条及以后
+# 删除条件：
+# 1. 交易流水号有效；
+# 2. 当前行信贷借据号为空；
+# 3a. 同交易流水号存在任意非空信贷借据号 → 删除当前空行；
+# 或
+# 3b. 同交易流水号全为空借据号，但当前是第 2 条及以后 → 删除。
 rows_to_remove = (
-    transaction_duplicated
-    & loan_no_empty
-    & empty_loan_rank.reindex(df.index).fillna(0).ge(1)
+    transaction_valid
+    & loan_empty
+    & (
+        has_non_empty_loan
+        | empty_loan_sequence.ge(1)
+    )
 )
 
-keep_mask[rows_to_remove] = False
-
-df_output = df[keep_mask].copy()
+df_output = df[~rows_to_remove].copy()
 
 Alteryx.write(df_output, 1)
