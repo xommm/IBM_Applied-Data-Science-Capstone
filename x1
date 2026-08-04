@@ -1,0 +1,34 @@
+from ayx import Alteryx
+import pandas as pd
+
+# 读取输入数据
+df = Alteryx.read("#1")
+
+# 字段检查
+required_columns = ["交易流水号", "信贷借据号"]
+missing_columns = [
+    col for col in required_columns
+    if col not in df.columns
+]
+
+if missing_columns:
+    raise ValueError("缺少字段：" + ", ".join(missing_columns))
+
+# 判断“信贷借据号”是否为空：包含 Null、空字符串、纯空格
+loan_no_empty = (
+    df["信贷借据号"].isna()
+    | df["信贷借据号"].astype(str).str.strip().eq("")
+)
+
+# 标记交易流水号是否重复
+transaction_duplicated = df["交易流水号"].duplicated(keep=False)
+
+# 删除条件：
+# 交易流水号不唯一 且 信贷借据号为空
+rows_to_remove = transaction_duplicated & loan_no_empty
+
+# 保留其余记录
+df_output = df[~rows_to_remove].copy()
+
+# 输出
+Alteryx.write(df_output, 1)
