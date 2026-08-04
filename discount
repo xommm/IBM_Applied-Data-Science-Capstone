@@ -1,0 +1,343 @@
+from ayx import Alteryx
+import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
+import re
+
+
+# ==========================================
+# 1. 读取输入
+# #1：Discount
+# #2：Proposal
+# ==========================================
+discount = Alteryx.read("#1").copy()
+proposal = Alteryx.read("#2").copy()
+
+discount.columns = discount.columns.astype(str).str.strip()
+proposal.columns = proposal.columns.astype(str).str.strip()
+
+
+# ==========================================
+# 2. 检查字段
+# ==========================================
+discount_required = [
+    "Internal Buyer Reference",
+    "Discount Transaction Reference",
+    "Total Invoice Amount",
+    "Buyer Name (Local)"
+]
+
+proposal_required = [
+    "Buyer Name (Local)",
+    "Internal Buyer Reference",
+    "Proposal Reference",
+    "Proposal Total Amount"
+]
+
+missing_discount = [
+    col for col in discount_required
+    if col not in discount.columns
+]
+
+missing_proposal = [
+    col for col in proposal_required
+    if col not in proposal.columns
+]
+
+if missing_discount:
+    raise ValueError(
+        "Discount 表缺少字段：" + ", ".join(missing_discount)
+    )
+
+if missing_proposal:
+    raise ValueError(
+        "Proposal 表缺少字段：" + ", ".join(missing_proposal)
+    )
+
+
+# ==========================================
+# 3. 辅助函数
+# ==========================================
+def clean_text(value):
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    return text if text else None
+
+
+def normalize_reference(value):
+    """标准化 Reference，用于匹配。"""
+    text = clean_text(value)
+
+    if text is None:
+        return None
+
+    return re.sub(r"\s+", "", text).lower()
+
+
+def amount_to_cents(value):
+    """将金额转换为整数分，避免浮点数精度误差。"""
+    if pd.isna(value):
+        return None
+
+    try:
+        text = str(value).strip()
+        text = text.replace(",", "").replace("，", "")
+
+        if not text:
+            return None
+
+        amount = Decimal(text).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+
+        return int(amount * 100)
+
+    except Exception:
+        return None
+
+
+def cents_to_amount(value):
+    """将整数分转换为两位小数金额。"""
+    if value is None or pd.isna(value):
+        return None
+
+    return float(
+        (Decimal(int(value)) / Decimal("100")).quantize(
+            Decimal("0.00"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+
+def split_discount_reference(value):
+    """
+    从 Discount Transaction Reference 提取：
+    1. Proposal Reference
+    2. Discount 顺序
+
+    示例：
+    ABC_1 -> (ABC, 1)
+    ABC_2 -> (ABC, 2)
+    ABC   -> (ABC, 1)
+    """
+    reference = clean_text(value)
+
+    if reference is None:
+        return None, None
+
+    match = re.match(r"^(.*)_(\d+)$", reference)
+
+    if match:
+        proposal_reference = match.group(1).strip()
+        sequence = int(match.group(2))
+
+        return normalize_reference(proposal_reference), sequence
+
+    return normalize_reference(reference), 1
+
+
+# ==========================================
+# 4. 创建匹配字段
+# ==========================================
+discount["_discount_row_id"] = range(len(discount))
+
+reference_info = (
+    discount["Discount Transaction Reference"]
+    .apply(split_discount_reference)
+)
+
+discount["_proposal_reference_key"] = reference_info.apply(
+    lambda item: item[0]
+)
+
+discount["_discount_sequence"] = reference_info.apply(
+    lambda item: item[1]
+)
+
+discount["_amount_cents"] = (
+    discount["Total Invoice Amount"]
+    .apply(amount_to_cents)
+)
+
+proposal["_proposal_reference_key"] = (
+    proposal["Proposal Reference"]
+    .apply(normalize_reference)
+)
+
+proposal["_proposal_amount_cents"] = (
+    proposal["Proposal Total Amount"]
+    .apply(amount_to_cents)
+)
+
+
+# ==========================================
+# 5. 检查 Proposal Reference 是否重复
+# ==========================================
+duplicated_reference = (
+    proposal["_proposal_reference_key"].notna()
+    & proposal["_proposal_reference_key"].duplicated(keep=False)
+)
+
+if duplicated_reference.any():
+    duplicated_values = (
+        proposal.loc[
+            duplicated_reference,
+            "Proposal Reference"
+        ]
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+
+    raise ValueError(
+        "Proposal Reference 存在重复，无法唯一匹配："
+        + ", ".join(duplicated_values[:20])
+    )
+
+
+# ==========================================
+# 6. 按 Proposal 生成结果
+# ==========================================
+output_records = []
+
+for _, proposal_row in proposal.iterrows():
+
+    proposal_key = proposal_row["_proposal_reference_key"]
+    proposal_amount = proposal_row["_proposal_amount_cents"]
+
+    if proposal_key is None:
+        related_discounts = discount.iloc[0:0].copy()
+    else:
+        related_discounts = discount[
+            discount["_proposal_reference_key"] == proposal_key
+        ].copy()
+
+    # 按 _1、_2、_3 排序
+    related_discounts = related_discounts.sort_values(
+        by=["_discount_sequence", "_discount_row_id"],
+        kind="stable",
+        na_position="last"
+    )
+
+    # --------------------------------------
+    # 没有对应 Discount
+    # --------------------------------------
+    if related_discounts.empty:
+        output_records.append({
+            "Internal Buyer Reference":
+                proposal_row["Internal Buyer Reference"],
+
+            "Discount Transaction Reference": None,
+
+            "Proposal Total Amount":
+                cents_to_amount(proposal_amount),
+
+            "Buyer Name (Local)":
+                proposal_row["Buyer Name (Local)"]
+        })
+
+        continue
+
+    discount_amounts = related_discounts[
+        "_amount_cents"
+    ].tolist()
+
+    proposal_amount_valid = (
+        proposal_amount is not None
+        and not pd.isna(proposal_amount)
+    )
+
+    discount_amounts_valid = all(
+        amount is not None and not pd.isna(amount)
+        for amount in discount_amounts
+    )
+
+    # --------------------------------------
+    # 只有一笔 Discount：使用 Proposal 金额
+    # --------------------------------------
+    if len(related_discounts) == 1:
+        final_amounts = [
+            int(proposal_amount)
+            if proposal_amount_valid
+            else discount_amounts[0]
+        ]
+
+    # --------------------------------------
+    # 多笔 Discount
+    # --------------------------------------
+    elif proposal_amount_valid and discount_amounts_valid:
+
+        discount_sum = sum(
+            int(amount) for amount in discount_amounts
+        )
+
+        if discount_sum == int(proposal_amount):
+            # 合计一致，保留全部原始 Discount 金额
+            final_amounts = [
+                int(amount) for amount in discount_amounts
+            ]
+
+        else:
+            # 合计不一致：
+            # 保留前 N-1 笔，最后一笔调整为剩余金额
+            previous_sum = sum(
+                int(amount)
+                for amount in discount_amounts[:-1]
+            )
+
+            adjusted_last_amount = (
+                int(proposal_amount) - previous_sum
+            )
+
+            final_amounts = [
+                int(amount)
+                for amount in discount_amounts[:-1]
+            ] + [adjusted_last_amount]
+
+    else:
+        # 金额无法解析时，不自动调整
+        final_amounts = discount_amounts
+
+    # 输出对应 Discount
+    for position, (_, discount_row) in enumerate(
+        related_discounts.iterrows()
+    ):
+        output_records.append({
+            "Internal Buyer Reference":
+                proposal_row["Internal Buyer Reference"],
+
+            "Discount Transaction Reference":
+                discount_row["Discount Transaction Reference"],
+
+            "Proposal Total Amount":
+                cents_to_amount(final_amounts[position]),
+
+            "Buyer Name (Local)":
+                proposal_row["Buyer Name (Local)"]
+        })
+
+
+# ==========================================
+# 7. 最终输出
+# ==========================================
+output_columns = [
+    "Internal Buyer Reference",
+    "Discount Transaction Reference",
+    "Proposal Total Amount",
+    "Buyer Name (Local)"
+]
+
+df_output = pd.DataFrame(
+    output_records,
+    columns=output_columns
+)
+
+# 设置为两位小数数值类型
+df_output["Proposal Total Amount"] = pd.to_numeric(
+    df_output["Proposal Total Amount"],
+    errors="coerce"
+).round(2)
+
+Alteryx.write(df_output, 1)
