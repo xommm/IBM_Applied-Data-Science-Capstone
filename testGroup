@@ -1,0 +1,343 @@
+from ayx import Alteryx
+import pandas as pd
+from itertools import combinations
+from decimal import Decimal, InvalidOperation
+
+# ============================================================
+# 参数设置
+# ============================================================
+
+# 防止组合数量过大导致运行时间过长。
+# 如业务上允许更多 Payment 组成一笔 Proposal，可适当调大。
+MAX_COMBINATION_SIZE = 8
+
+# 金额必须完全一致，不允许容差。
+AMOUNT_TOLERANCE = Decimal("0.00")
+
+
+# ============================================================
+# 读取两个输入
+# Python Tool 输入连接：
+#   #1 = Payment 表
+#   #2 = Proposal 表
+# ============================================================
+
+payment = Alteryx.read("#1")
+proposal = Alteryx.read("#2")
+
+# 保存 Payment 原始字段，用于输出未匹配记录。
+payment_original_columns = payment.columns.tolist()
+
+
+# ============================================================
+# 检查必需字段
+# ============================================================
+
+required_payment_columns = [
+    "Payment Group Reference",
+    "Payment Net Amount",
+    "Currency",
+    "Drawee (Local)",
+    "Drawer (Local)",
+    "Payment Group Status"
+]
+
+required_proposal_columns = [
+    "Internal Buyer Reference",
+    "Sum_Proposal Total Amount",
+    "First_Buyer Name (Local)"
+]
+
+
+def check_required_columns(df, required_columns, table_name):
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "{} 缺少以下字段：{}".format(
+                table_name,
+                ", ".join(missing_columns)
+            )
+        )
+
+
+check_required_columns(
+    payment,
+    required_payment_columns,
+    "Payment 表"
+)
+
+check_required_columns(
+    proposal,
+    required_proposal_columns,
+    "Proposal 表"
+)
+
+
+# ============================================================
+# 添加内部唯一标识和原始顺序
+# ============================================================
+
+payment["_payment_id"] = range(len(payment))
+proposal["_proposal_id"] = range(len(proposal))
+
+
+# ============================================================
+# 清理买方名称
+# 匹配条件：
+# Payment.Drawee (Local)
+#     =
+# Proposal.First_Buyer Name (Local)
+# ============================================================
+
+def normalize_buyer(value):
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+payment["_buyer_key"] = payment["Drawee (Local)"].apply(
+    normalize_buyer
+)
+
+proposal["_buyer_key"] = proposal[
+    "First_Buyer Name (Local)"
+].apply(normalize_buyer)
+
+
+# ============================================================
+# 金额转换
+# 使用 Decimal，避免浮点数精度问题
+# ============================================================
+
+def to_decimal(value):
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+
+    if text == "":
+        return None
+
+    # 清除常见千位分隔符和空格。
+    text = (
+        text
+        .replace(",", "")
+        .replace("，", "")
+        .replace(" ", "")
+    )
+
+    # 处理括号表示的负数，例如 (1,000.00)。
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+payment["_amount"] = payment[
+    "Payment Net Amount"
+].apply(to_decimal)
+
+proposal["_amount"] = proposal[
+    "Sum_Proposal Total Amount"
+].apply(to_decimal)
+
+
+# ============================================================
+# 匹配逻辑
+#
+# 规则：
+# 1. 必须是同一个买方。
+# 2. 先匹配单笔 Payment。
+# 3. 单笔无法匹配时，按 Payment 笔数从少到多寻找组合。
+# 4. 金额必须完全相等，金额容差为 0。
+# 5. 一笔 Payment 匹配成功后立即移除，不能重复使用。
+# 6. Proposal 按输入表原始顺序进行处理。
+# ============================================================
+
+available_payment_ids = set(payment["_payment_id"].tolist())
+matched_rows = []
+
+proposal_sorted = proposal.sort_values(
+    "_proposal_id",
+    kind="stable"
+)
+
+for _, proposal_row in proposal_sorted.iterrows():
+
+    target_amount = proposal_row["_amount"]
+    buyer_key = proposal_row["_buyer_key"]
+
+    # Proposal 金额无效或买方为空时，不进行匹配。
+    if target_amount is None or buyer_key == "":
+        continue
+
+    # 只选取：
+    # 1. 尚未使用的 Payment；
+    # 2. 同一个买方；
+    # 3. 金额有效的 Payment。
+    candidates = payment[
+        payment["_payment_id"].isin(available_payment_ids)
+        & (payment["_buyer_key"] == buyer_key)
+        & payment["_amount"].notna()
+    ].sort_values(
+        "_payment_id",
+        kind="stable"
+    )
+
+    if candidates.empty:
+        continue
+
+    candidate_items = list(
+        candidates[
+            ["_payment_id", "_amount"]
+        ].itertuples(
+            index=False,
+            name=None
+        )
+    )
+
+    selected_payment_ids = None
+
+    max_combination_size = min(
+        MAX_COMBINATION_SIZE,
+        len(candidate_items)
+    )
+
+    # 从 1 笔开始，因此单笔优先；
+    # 如果单笔无法匹配，再依次尝试 2 笔、3 笔……
+    for combination_size in range(
+        1,
+        max_combination_size + 1
+    ):
+
+        for payment_combination in combinations(
+            candidate_items,
+            combination_size
+        ):
+            combination_total = sum(
+                (
+                    item[1]
+                    for item in payment_combination
+                ),
+                Decimal("0")
+            )
+
+            # 容差为 0，金额必须完全一致。
+            if (
+                abs(combination_total - target_amount)
+                <= AMOUNT_TOLERANCE
+            ):
+                selected_payment_ids = [
+                    item[0]
+                    for item in payment_combination
+                ]
+                break
+
+        if selected_payment_ids is not None:
+            break
+
+    # 当前 Proposal 没有找到对应组合。
+    if selected_payment_ids is None:
+        continue
+
+    # 先一次性确认所有 Payment 仍然可用。
+    # 正常情况下都应可用，此检查可进一步避免重复使用。
+    if not all(
+        payment_id in available_payment_ids
+        for payment_id in selected_payment_ids
+    ):
+        continue
+
+    # 匹配成功后立即从可用集合中删除。
+    # 因此同一笔 Payment 无法再次匹配其他 Proposal。
+    for payment_id in selected_payment_ids:
+        available_payment_ids.remove(payment_id)
+
+    # 输出每一笔成功匹配的 Payment。
+    # 多笔 Payment 对应一笔 Proposal 时，会输出多行，
+    # 并使用相同的 Internal Buyer Reference。
+    selected_payments = payment[
+        payment["_payment_id"].isin(
+            selected_payment_ids
+        )
+    ].sort_values(
+        "_payment_id",
+        kind="stable"
+    )
+
+    for _, payment_row in selected_payments.iterrows():
+        matched_rows.append({
+            "Payment Group Reference":
+                payment_row["Payment Group Reference"],
+
+            "Payment Net Amount":
+                payment_row["Payment Net Amount"],
+
+            "Drawee (Local)":
+                payment_row["Drawee (Local)"],
+
+            "Internal Buyer Reference":
+                proposal_row["Internal Buyer Reference"]
+        })
+
+
+# ============================================================
+# 输出 1：成功匹配的 Payment 明细
+#
+# 字段顺序：
+# Payment Group Reference
+# Payment Net Amount
+# Drawee (Local)
+# Internal Buyer Reference
+# ============================================================
+
+matched_output_columns = [
+    "Payment Group Reference",
+    "Payment Net Amount",
+    "Drawee (Local)",
+    "Internal Buyer Reference"
+]
+
+matched_output = pd.DataFrame(
+    matched_rows,
+    columns=matched_output_columns
+)
+
+
+# ============================================================
+# 输出 2：未匹配的 Payment
+# 保持 Payment 原始字段、原始值及原始行顺序
+# ============================================================
+
+unmatched_output = (
+    payment[
+        payment["_payment_id"].isin(
+            available_payment_ids
+        )
+    ]
+    .sort_values(
+        "_payment_id",
+        kind="stable"
+    )
+    [payment_original_columns]
+    .copy()
+)
+
+
+# ============================================================
+# 写入 Alteryx Python Tool 的两个输出锚点
+#
+# 输出锚点 1：匹配成功
+# 输出锚点 2：未匹配 Payment
+# ============================================================
+
+Alteryx.write(matched_output, 1)
+Alteryx.write(unmatched_output, 2)
