@@ -1,0 +1,327 @@
+from ayx import Package
+from ayx import Alteryx
+import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
+import re
+import unicodedata
+import numpy as np
+
+# ==========================================
+# 0. 参数与目标设定
+# ==========================================
+# 明确设定：仅处理“联合利华（中国）有限公司”这一家公司
+TARGET_CLIENT_KEY = "联合利华(中国)有限公司"
+TARGET_CLIENT_FUZZY = "联合利华"
+
+ENABLE_DEBUG_DIAGNOSTICS = True  # 保留诊断列便于在 Alteryx 结果页面查看
+
+
+# ==========================================
+# 1. 辅助函数（严格两位小数控制与名称规范）
+# ==========================================
+def normalize_name_strict(value):
+    """严格规范化：NFKC转半角 + 清理Null/BOM/空格"""
+    if pd.isna(value):
+        return None
+
+    s = str(value).replace("\x00", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFKC", s).strip()
+
+    if not text:
+        return None
+
+    text = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", text)
+    text = re.sub(r"\s+", "", text)
+    text = text.lower()
+    text = text.replace("（", "(").replace("）", ")")
+    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\(\)\-\,\.\u00b7]", "", text)
+
+    return text if text else None
+
+
+def normalize_name_fuzzy(value):
+    """模糊规范化：剥离常见公司后缀"""
+    if pd.isna(value):
+        return None
+
+    s = str(value).replace("\x00", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFKC", s).strip()
+    if not text:
+        return None
+
+    text = text.lower()
+    text = re.sub(r"[^\w\u4e00-\u9fff]", "", text)
+    
+    suffixes = [
+        "有限责任公司", "股份有限公司", "有限公司", "责任公司", 
+        "分公司", "公司", "中国", "上海分行", "分行"
+    ]
+    for sfx in suffixes:
+        text = text.replace(sfx, "")
+
+    return text if text else None
+
+
+def to_cents(value):
+    """
+    统一将 Double 浮点数、V_WString 文本转换为整数分。
+    严格按 ROUND_HALF_UP 四舍五入到 2 位小数 (0.01 元 = 1 分)。
+    """
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value) or np.isinf(value):
+            return None
+        num_str = f"{value:.2f}"
+    elif isinstance(value, (int, np.integer)):
+        num_str = str(value)
+    else:
+        s = unicodedata.normalize("NFKC", str(value)).strip()
+        if not s:
+            return None
+
+        s = s.replace("\x00", "").replace("\ufeff", "").replace(",", "")
+        s = s.replace("￥", "").replace("$", "").replace("¥", "").replace("CNY", "")
+        s = s.replace("．", ".").replace("。", ".")
+        
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+
+        m = re.search(r"[-]?\d+(\.\d+)?([eE][+-]?\d+)?", s)
+        if not m:
+            return None
+        num_str = m.group(0)
+
+    try:
+        amt = Decimal(num_str).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+        return int(amt * 100)
+    except Exception:
+        return None
+
+
+def format_money_from_cents(cents):
+    """将整数分转换为固定两位小数的字符串。"""
+    if cents is None:
+        return None
+    return f"{Decimal(int(cents)) / Decimal(100):.2f}"
+
+
+def format_unique_field(record_list, field_name):
+    """去重拼接格式化字段。"""
+    valid_values = []
+    seen = set()
+    for record in record_list:
+        value = record.get(field_name)
+        if pd.isna(value):
+            continue
+        string_value = str(value).strip()
+        if not string_value or string_value in seen:
+            continue
+        valid_values.append(string_value)
+        seen.add(string_value)
+    return ", ".join(valid_values) if valid_values else None
+
+
+# ==========================================
+# 2. 读取 Alteryx 输入端口 #1 与 #2
+# ==========================================
+df_proposal_raw = Alteryx.read("#1")
+df_payment_raw = Alteryx.read("#2")
+
+# 清理列名前后空格
+df_proposal_raw.columns = [str(c).strip() for c in df_proposal_raw.columns]
+df_payment_raw.columns = [str(c).strip() for c in df_payment_raw.columns]
+
+print("=== [ALTERYX UNILEVER MATCH DEBUG] ===")
+print(f"输入 #1 (Proposal) 全量行数: {len(df_proposal_raw)}")
+print(f"输入 #2 (Payment)  全量行数: {len(df_payment_raw)}")
+
+
+# ==========================================
+# 3. 补齐主键与必需字段检查
+# ==========================================
+df_proposal = df_proposal_raw.copy()
+df_payment = df_payment_raw.copy()
+
+if "proposal_key" not in df_proposal.columns or df_proposal["proposal_key"].isna().all():
+    if "Record" in df_proposal.columns:
+        df_proposal["proposal_key"] = df_proposal["Record"]
+    else:
+        df_proposal["proposal_key"] = range(1, len(df_proposal) + 1)
+df_proposal["proposal_key"] = df_proposal["proposal_key"].fillna(df_proposal.index.to_series() + 1)
+
+if "payment_key" not in df_payment.columns or df_payment["payment_key"].isna().all():
+    if "Record" in df_payment.columns:
+        df_payment["payment_key"] = df_payment["Record"]
+    else:
+        df_payment["payment_key"] = range(1, len(df_payment) + 1)
+df_payment["payment_key"] = df_payment["payment_key"].fillna(df_payment.index.to_series() + 1)
+
+required_proposal_columns = ["proposal_key", "Buyer Name (Local)", "Proposal Total Amount"]
+required_payment_columns = ["payment_key", "Client_Name", "Yesterday_Balance"]
+
+missing_proposal = [c for c in required_proposal_columns if c not in df_proposal.columns]
+missing_payment = [c for c in required_payment_columns if c not in df_payment.columns]
+
+if missing_proposal:
+    raise ValueError("Proposal 输入缺少必需列：" + ", ".join(missing_proposal))
+if missing_payment:
+    raise ValueError("Payment 输入缺少必需列：" + ", ".join(missing_payment))
+
+optional_payment_columns = ["Debit Account", "Debtor_Agent_Name", "Debtor Agent Party ID"]
+for col in optional_payment_columns:
+    if col not in df_payment.columns:
+        df_payment[col] = None
+
+
+# ==========================================
+# 4. 强制过滤：只保留“联合利华（中国）有限公司”
+# ==========================================
+df_proposal["_proposal_row_id"] = range(len(df_proposal))
+df_payment["_payment_row_id"] = range(len(df_payment))
+
+df_proposal["_client_strict_key"] = df_proposal["Buyer Name (Local)"].apply(normalize_name_strict)
+df_payment["_client_strict_key"] = df_payment["Client_Name"].apply(normalize_name_strict)
+
+df_proposal["_client_fuzzy_key"] = df_proposal["Buyer Name (Local)"].apply(normalize_name_fuzzy)
+df_payment["_client_fuzzy_key"] = df_payment["Client_Name"].apply(normalize_name_fuzzy)
+
+df_proposal["_amount_cents"] = df_proposal["Proposal Total Amount"].apply(to_cents)
+df_payment["_amount_cents"] = df_payment["Yesterday_Balance"].apply(to_cents)
+
+# 核心过滤条件：只选取联合利华（中国）有限公司
+is_unilever_proposal = (df_proposal["_client_strict_key"] == TARGET_CLIENT_KEY) | (df_proposal["_client_fuzzy_key"] == TARGET_CLIENT_FUZZY)
+is_unilever_payment = (df_payment["_client_strict_key"] == TARGET_CLIENT_KEY) | (df_payment["_client_fuzzy_key"] == TARGET_CLIENT_FUZZY)
+
+df_proposal_unilever = df_proposal[is_unilever_proposal].copy()
+df_payment_unilever = df_payment[is_unilever_payment].copy()
+
+print(f"过滤后仅保留联合利华 Proposal 行数: {len(df_proposal_unilever)}")
+print(f"过滤后仅保留联合利华 Payment  行数: {len(df_payment_unilever)}")
+
+if ENABLE_DEBUG_DIAGNOSTICS:
+    df_proposal_unilever["_debug_proposal_raw_amount"] = df_proposal_unilever["_amount_cents"].apply(lambda c: round(c / 100.0, 2) if pd.notna(c) else None)
+    df_payment_unilever["_debug_payment_raw_amount"] = df_payment_unilever["_amount_cents"].apply(lambda c: round(c / 100.0, 2) if pd.notna(c) else None)
+    df_proposal_unilever["_debug_proposal_raw_name"] = df_proposal_unilever["Buyer Name (Local)"]
+    df_payment_unilever["_debug_payment_raw_name"] = df_payment_unilever["Client_Name"]
+    df_proposal_unilever["_debug_proposal_client_key"] = df_proposal_unilever["_client_strict_key"]
+    df_payment_unilever["_debug_payment_client_key"] = df_payment_unilever["_client_strict_key"]
+
+
+# ==========================================
+# 5. 专项联合利华匹配逻辑
+# ==========================================
+match_results = {}
+matched_payment_row_ids = set()
+
+if not df_proposal_unilever.empty and not df_payment_unilever.empty:
+    prop_records = df_proposal_unilever.to_dict("records")
+    pay_records = df_payment_unilever.to_dict("records")
+
+    available_proposals = [
+        {"row_id": int(r["_proposal_row_id"]), "id": r["proposal_key"], "amount": int(r["_amount_cents"])}
+        for r in prop_records if pd.notna(r["_amount_cents"])
+    ]
+    available_payments = [
+        {"row_id": int(r["_payment_row_id"]), "id": r["payment_key"], "amount": int(r["_amount_cents"]),
+         "Debit Account": r["Debit Account"], "Debtor_Agent_Name": r["Debtor_Agent_Name"], "Debtor Agent Party ID": r["Debtor Agent Party ID"]}
+        for r in pay_records if pd.notna(r["_amount_cents"])
+    ]
+
+    total_prop_cents = sum(p["amount"] for p in available_proposals)
+    
+    # 对每笔 Payment 尝试匹配
+    for payment in available_payments:
+        if payment["amount"] == total_prop_cents and len(available_proposals) >= 1:
+            print("✅ 联合利华全额直通匹配成功！所有 Proposal 总额与 Payment 完全相等！")
+            
+            pay_id_str = str(payment["id"])
+            pay_amt_str = format_money_from_cents(payment["amount"])
+            prop_ids_str = ", ".join(str(p["id"]) for p in available_proposals)
+            debit_acc = format_unique_field([payment], "Debit Account")
+            agent_name = format_unique_field([payment], "Debtor_Agent_Name")
+            agent_party_id = format_unique_field([payment], "Debtor Agent Party ID")
+
+            match_info = {
+                "Matched_Payment_IDs": pay_id_str,
+                "Matched_Payment_Amounts": pay_amt_str,
+                "Matched_Debit_Account": debit_acc,
+                "Matched_Debtor_Agent_Name": agent_name,
+                "Matched_Debtor_Agent_Party_ID": agent_party_id,
+                "Group_Matched_Proposals": prop_ids_str,
+                "Group_Target_Sum": round(payment["amount"] / 100.0, 2),
+                "Match_Type": "Many-Proposals-to-One-Payment",
+                "Matched_Proposal_Count": len(available_proposals),
+                "Matched_Payment_Count": 1
+            }
+
+            for p in available_proposals:
+                match_results[p["row_id"]] = match_info
+
+            matched_payment_row_ids.add(payment["row_id"])
+            break
+
+
+# ==========================================
+# 6. 将匹配结果回填到联合利华 Proposal 中
+# ==========================================
+def get_match_value(proposal_row_id, column_name):
+    if pd.isna(proposal_row_id):
+        return None
+    result = match_results.get(int(proposal_row_id))
+    return result.get(column_name) if result else None
+
+
+result_columns = [
+    "Matched_Payment_IDs",
+    "Matched_Payment_Amounts",
+    "Matched_Debit_Account",
+    "Matched_Debtor_Agent_Name",
+    "Matched_Debtor_Agent_Party_ID",
+    "Group_Matched_Proposals",
+    "Group_Target_Sum",
+    "Match_Type",
+    "Matched_Proposal_Count",
+    "Matched_Payment_Count"
+]
+
+# 仅对联合利华数据填入匹配列
+for column_name in result_columns:
+    df_proposal_unilever[column_name] = df_proposal_unilever["_proposal_row_id"].apply(
+        lambda rid, col=column_name: get_match_value(rid, col)
+    )
+
+# 仅筛选未匹配到的联合利华 Payment
+df_unmatched_payments = df_payment_unilever[
+    ~df_payment_unilever["_payment_row_id"].isin(matched_payment_row_ids)
+].copy()
+
+
+# ==========================================
+# 7. 删除辅助列并写入 Alteryx 输出端口 1 和 2
+# ==========================================
+proposal_internal = ["_proposal_row_id", "_client_strict_key", "_client_fuzzy_key", "_amount_cents"]
+payment_internal = ["_payment_row_id", "_client_strict_key", "_client_fuzzy_key", "_amount_cents"]
+
+df_proposal_out = df_proposal_unilever.drop(columns=[c for c in proposal_internal if c in df_proposal_unilever.columns])
+df_payment_out = df_unmatched_payments.drop(columns=[c for c in payment_internal if c in df_unmatched_payments.columns])
+
+if not ENABLE_DEBUG_DIAGNOSTICS:
+    diag_cols = [
+        "_debug_proposal_raw_amount", "_debug_payment_raw_amount",
+        "_debug_proposal_raw_name", "_debug_payment_raw_name",
+        "_debug_proposal_client_key", "_debug_payment_client_key"
+    ]
+    df_proposal_out = df_proposal_out.drop(columns=[c for c in diag_cols if c in df_proposal_out.columns])
+    df_payment_out = df_payment_out.drop(columns=[c for c in diag_cols if c in df_payment_out.columns])
+
+print(f"写入 Output 端口 1 (联合利华 Proposal) 行数: {len(df_proposal_out)}")
+print(f"写入 Output 端口 2 (联合利华未匹配 Payment) 行数: {len(df_payment_out)}")
+
+# 写入 Alteryx 两个输出端口
+Alteryx.write(df_proposal_out, 1)
+Alteryx.write(df_payment_out, 2)
