@@ -5,53 +5,42 @@ from itertools import combinations
 from decimal import Decimal, ROUND_HALF_UP
 import re
 import unicodedata
+import numpy as np
 
 # ==========================================
 # 0. 可调整参数
 # ==========================================
-MAX_PROPOSALS_PER_MATCH = 10
-MAX_PAYMENTS_PER_MATCH = 10
+MAX_PROPOSALS_PER_MATCH = 50  # 适度放宽组合笔数上限（防止全量数据下溢出）
+MAX_PAYMENTS_PER_MATCH = 50
 
-# 若你希望更严格/更宽松的匹配，可调整：
 ENABLE_DEBUG_DIAGNOSTICS = True  # 生成诊断列用于排查金额/客户键问题
 
 
 # ==========================================
-# 1. 辅助函数
+# 1. 辅助函数（针对 Alteryx 类型转换增强）
 # ==========================================
 def normalize_name(value):
     """
     规范客户名称：
-    1. Unicode 全角转半角
-    2. 去除首尾空格
-    3. 删除内部空白、换行等
-    4. 转小写
-    5. 删除常见不可见字符、并只保留字母/数字/中文/部分标点
+    剔除全角/半角差异、空格、Null字节(\x00)、BOM(\ufeff)及不可见字符
     """
     if pd.isna(value):
         return None
 
-    text = unicodedata.normalize("NFKC", str(value)).strip()
+    s = str(value)
+    # 彻底清理 Alteryx V_WString 常见的 Null 字节与 BOM 头
+    s = s.replace("\x00", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFKC", s).strip()
 
     if not text:
         return None
 
-    # 去掉零宽字符、非打印字符
-    # 常见：\u200b, \u200c, \u200d, \ufeff 等
-    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
-
-    # 统一空白：去掉所有空白字符（包括全角空格）
+    # 去掉零宽字符、非打印字符、不间断空格
+    text = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", text)
+    # 去掉所有空白字符（包括全角空格 \u3000）
     text = re.sub(r"\s+", "", text)
-
-    # 转小写
     text = text.lower()
-
-    # 可选：把常见括号变体统一（如果你担心括号影响）
-    # 但你已说括号不是问题，这里仍做轻量规范化
     text = text.replace("（", "(").replace("）", ")")
-
-    # 如存在奇怪字符，尽量剔除非必要符号，但保留中英文/数字/括号/逗号/点/破折号等
-    # 你如果认为客户名里有特殊符号，可再放宽此规则
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\(\)\-\,\.\u00b7]", "", text)
 
     return text if text else None
@@ -60,28 +49,32 @@ def normalize_name(value):
 def to_cents(value):
     """
     将金额转换为整数分（ROUND_HALF_UP）。
-    重点增强：兼容 vwstring / double / 各种带逗号、货币符号、全角点、空白等输入。
+    彻底解决 Alteryx Double 浮点数科学计数法 (如 1.017e+06) 及 V_WString 格式干扰。
     """
     if pd.isna(value):
         return None
 
-    s = unicodedata.normalize("NFKC", str(value)).strip()
-    if not s:
-        return None
+    # 1. 处理数字类型 (Alteryx Double / Float / Int)
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value) or np.isinf(value):
+            return None
+        # 强制格式化为两位小数文本，杜绝科学计数法和浮点数尾数噪声
+        num_str = f"{value:.2f}"
+    elif isinstance(value, (int, np.integer)):
+        num_str = str(value)
+    else:
+        # 2. 处理文本类型 (Alteryx V_WString / String)
+        s = unicodedata.normalize("NFKC", str(value)).strip()
+        if not s:
+            return None
 
-    # 千分位逗号去掉（避免 Decimal 解析失败）
-    s = s.replace(",", "")
-
-    # 替换全角点为半角点（NFKC理论上已转半角，但这里再保险）
-    s = s.replace("．", ".")
-    s = s.replace("。", ".")
-
-    # 提取第一个“看起来像数字”的片段：允许负号、整数或小数
-    m = re.search(r"[-]?\d+(\.\d+)?", s)
-    if not m:
-        return None
-
-    num_str = m.group(0)
+        s = s.replace(",", "").replace("．", ".").replace("。", ".")
+        
+        # 匹配可能包含科学计数法或普通小数的数值字符串
+        m = re.search(r"[-]?\d+(\.\d+)?([eE][+-]?\d+)?", s)
+        if not m:
+            return None
+        num_str = m.group(0)
 
     try:
         amt = Decimal(num_str).quantize(
@@ -123,13 +116,7 @@ def format_unique_field(record_list, field_name):
 
 
 def find_best_subset(records, target, max_items):
-    """
-    在 records 中寻找金额合计等于 target 的组合（整数分精确匹配）。
-
-    返回规则：
-    1. 优先使用记录数量最少的组合；
-    2. 相同数量时，按金额降序及内部行号返回第一个组合。
-    """
+    """在 records 中寻找金额合计等于 target 的组合（整数分精确匹配）。"""
     if target < 0:
         return None
 
@@ -139,7 +126,6 @@ def find_best_subset(records, target, max_items):
     if target == 0:
         return [zero_records[0]] if zero_records else None
 
-    # 金额降序，行号升序
     sorted_records = sorted(
         positive_records,
         key=lambda r: (-r["amount"], r["row_id"])
@@ -174,7 +160,6 @@ def find_best_subset(records, target, max_items):
             if remaining < 0:
                 return
 
-            # 剪枝：最大/最小可能合计
             max_possible = sum(
                 sorted_records[i]["amount"]
                 for i in range(start_index, start_index + slots_left)
@@ -189,12 +174,10 @@ def find_best_subset(records, target, max_items):
 
             last_amount = None
 
-            # 枚举选择
             for index in range(start_index, record_count - slots_left + 1):
                 record = sorted_records[index]
                 amount = record["amount"]
 
-                # 同一递归层跳过相同金额，减少重复搜索
                 if last_amount is not None and amount == last_amount:
                     continue
                 last_amount = amount
@@ -229,12 +212,17 @@ df_payment = Alteryx.read("#2")
 # ==========================================
 if "proposal_key" not in df_proposal.columns:
     if "Record" in df_proposal.columns:
-        df_proposal = df_proposal.rename(columns={"Record": "proposal_key"})
+        df_proposal["proposal_key"] = df_proposal["Record"]
     else:
         raise ValueError("Proposal 输入缺少 proposal_key 或 Record 字段。")
+else:
+    # 针对 proposal_key 列全是 NaN 时的补齐容错
+    if df_proposal["proposal_key"].isna().all() and "Record" in df_proposal.columns:
+        df_proposal["proposal_key"] = df_proposal["Record"]
 
-if "Record" in df_payment.columns:
-    df_payment = df_payment.drop(columns=["Record"])
+if "payment_key" not in df_payment.columns:
+    if "Record" in df_payment.columns:
+        df_payment["payment_key"] = df_payment["Record"]
 
 required_proposal_columns = [
     "proposal_key",
@@ -282,18 +270,20 @@ df_payment["_payment_row_id"] = range(len(df_payment))
 df_proposal["_client_match_key"] = df_proposal["Buyer Name (Local)"].apply(normalize_name)
 df_payment["_client_match_key"] = df_payment["Client_Name"].apply(normalize_name)
 
-# 为诊断先保留 raw（可选）
 if ENABLE_DEBUG_DIAGNOSTICS:
     df_proposal["_debug_proposal_raw_amount"] = df_proposal["Proposal Total Amount"]
     df_payment["_debug_payment_raw_amount"] = df_payment["Yesterday_Balance"]
     df_proposal["_debug_proposal_raw_name"] = df_proposal["Buyer Name (Local)"]
     df_payment["_debug_payment_raw_name"] = df_payment["Client_Name"]
 
-# 金额转分
+# 金额转整数分（自动判定 Double 浮点数与 V_WString 字符串）
 df_proposal["_amount_cents"] = df_proposal["Proposal Total Amount"].apply(to_cents)
 df_payment["_amount_cents"] = df_payment["Yesterday_Balance"].apply(to_cents)
 
-# 仅对关键字段 dropna
+if ENABLE_DEBUG_DIAGNOSTICS:
+    df_proposal["_debug_proposal_client_key"] = df_proposal["_client_match_key"]
+    df_payment["_debug_payment_client_key"] = df_payment["_client_match_key"]
+
 df_proposal_clean = df_proposal.dropna(
     subset=["proposal_key", "_client_match_key", "_amount_cents"]
 ).copy()
@@ -304,11 +294,6 @@ df_payment_clean = df_payment.dropna(
 df_proposal_clean["_amount_cents"] = df_proposal_clean["_amount_cents"].astype(int)
 df_payment_clean["_amount_cents"] = df_payment_clean["_amount_cents"].astype(int)
 
-if ENABLE_DEBUG_DIAGNOSTICS:
-    # 再保留用于定位的诊断信息（不改变后续逻辑）
-    df_proposal_clean["_debug_proposal_amount_cents"] = df_proposal_clean["_amount_cents"]
-    df_payment_clean["_debug_payment_amount_cents"] = df_payment_clean["_amount_cents"]
-
 
 # ==========================================
 # 5. 保存匹配结果
@@ -318,7 +303,6 @@ matched_payment_row_ids = set()
 
 
 def save_match(proposal_records, payment_records):
-    """保存一组 Proposal 与 Payment 的匹配结果。"""
     proposal_count = len(proposal_records)
     payment_count = len(payment_records)
 
@@ -389,18 +373,14 @@ for client_key, proposal_group in df_proposal_clean.groupby("_client_match_key",
             "Debtor Agent Party ID": row["Debtor Agent Party ID"]
         })
 
-    # 排序：金额降序，row_id升序
     available_proposals.sort(key=lambda r: (-r["amount"], r["row_id"]))
     available_payments.sort(key=lambda r: (-r["amount"], r["row_id"]))
 
-    # --------------------------------------------------
     # 阶段 A：同金额一对一
-    # --------------------------------------------------
     progress = True
     while progress and available_proposals and available_payments:
         progress = False
 
-        # 用更快的金额索引（避免在 list 里 next 搜）
         payment_by_amount = {}
         for pay in available_payments:
             payment_by_amount.setdefault(pay["amount"], []).append(pay)
@@ -410,7 +390,6 @@ for client_key, proposal_group in df_proposal_clean.groupby("_client_match_key",
                 continue
 
             matched_payment = payment_by_amount[proposal["amount"]][0]
-            # 保存
             save_match([proposal], [matched_payment])
 
             available_proposals = [p for p in available_proposals if p["row_id"] != proposal["row_id"]]
@@ -418,9 +397,7 @@ for client_key, proposal_group in df_proposal_clean.groupby("_client_match_key",
             progress = True
             break
 
-    # --------------------------------------------------
     # 阶段 B：一笔 Payment 匹配多笔 Proposal（proposal>=2）
-    # --------------------------------------------------
     progress = True
     while progress and available_proposals and available_payments:
         progress = False
@@ -444,9 +421,7 @@ for client_key, proposal_group in df_proposal_clean.groupby("_client_match_key",
             progress = True
             break
 
-    # --------------------------------------------------
     # 阶段 C：一笔 Proposal 匹配多笔 Payment（payment>=2）
-    # --------------------------------------------------
     progress = True
     while progress and available_proposals and available_payments:
         progress = False
@@ -470,9 +445,7 @@ for client_key, proposal_group in df_proposal_clean.groupby("_client_match_key",
             progress = True
             break
 
-    # --------------------------------------------------
     # 阶段 D：多 Proposal 对多 Payment（双方>=2）
-    # --------------------------------------------------
     progress = True
     while progress and available_proposals and available_payments:
         progress = False
@@ -569,13 +542,14 @@ payment_internal_columns = [
 df_proposal = df_proposal.drop(columns=[c for c in proposal_internal_columns if c in df_proposal.columns])
 df_unmatched_payments = df_unmatched_payments.drop(columns=[c for c in payment_internal_columns if c in df_unmatched_payments.columns])
 
-# 如果你不想留诊断字段，可以在这里加删列逻辑
 if not ENABLE_DEBUG_DIAGNOSTICS:
     diag_cols = [
         "_debug_proposal_raw_amount",
         "_debug_payment_raw_amount",
         "_debug_proposal_raw_name",
-        "_debug_payment_raw_name"
+        "_debug_payment_raw_name",
+        "_debug_proposal_client_key",
+        "_debug_payment_client_key"
     ]
     for col in diag_cols:
         if col in df_proposal.columns:
