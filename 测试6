@@ -6,16 +6,14 @@ from decimal import Decimal, ROUND_HALF_UP
 import re
 import unicodedata
 
-
 # ==========================================
 # 0. 可调整参数
 # ==========================================
-MAX_PROPOSALS_PER_MATCH = 50
-MAX_PAYMENTS_PER_MATCH = 50
+MAX_PROPOSALS_PER_MATCH = 10
+MAX_PAYMENTS_PER_MATCH = 10
 
-# True：输出诊断字段，方便检查客户名和金额转换结果。
-# 问题解决后可改为 False。
-KEEP_DEBUG_COLUMNS = True
+# 若你希望更严格/更宽松的匹配，可调整：
+ENABLE_DEBUG_DIAGNOSTICS = True  # 生成诊断列用于排查金额/客户键问题
 
 
 # ==========================================
@@ -24,68 +22,86 @@ KEEP_DEBUG_COLUMNS = True
 def normalize_name(value):
     """
     规范客户名称：
-    1. Unicode NFKC 规范化（全角转半角等）；
-    2. 转小写；
-    3. 删除零宽字符、BOM、不间断空格等不可见字符；
-    4. 仅保留汉字、英文字母和数字。
-
-    例如以下名称会得到相同匹配键：
-    联合利华（中国）有限公司
-    联合利华(中国)有限公司
-    联合利华 （中国） 有限公司
+    1. Unicode 全角转半角
+    2. 去除首尾空格
+    3. 删除内部空白、换行等
+    4. 转小写
+    5. 删除常见不可见字符、并只保留字母/数字/中文/部分标点
     """
     if pd.isna(value):
         return None
 
-    text = unicodedata.normalize("NFKC", str(value))
-    text = text.casefold()
+    text = unicodedata.normalize("NFKC", str(value)).strip()
 
-    text = re.sub(
-        r"[\u200b\u200c\u200d\u2060\ufeff\u00a0]",
-        "",
-        text
-    )
+    if not text:
+        return None
 
-    text = re.sub(
-        r"[^0-9a-z\u3400-\u4dbf\u4e00-\u9fff]+",
-        "",
-        text
-    )
+    # 去掉零宽字符、非打印字符
+    # 常见：\u200b, \u200c, \u200d, \ufeff 等
+    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+
+    # 统一空白：去掉所有空白字符（包括全角空格）
+    text = re.sub(r"\s+", "", text)
+
+    # 转小写
+    text = text.lower()
+
+    # 可选：把常见括号变体统一（如果你担心括号影响）
+    # 但你已说括号不是问题，这里仍做轻量规范化
+    text = text.replace("（", "(").replace("）", ")")
+
+    # 如存在奇怪字符，尽量剔除非必要符号，但保留中英文/数字/括号/逗号/点/破折号等
+    # 你如果认为客户名里有特殊符号，可再放宽此规则
+    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\(\)\-\,\.\u00b7]", "", text)
 
     return text if text else None
 
 
 def to_cents(value):
-    """使用 ROUND_HALF_UP 将金额转换成整数分。"""
+    """
+    将金额转换为整数分（ROUND_HALF_UP）。
+    重点增强：兼容 vwstring / double / 各种带逗号、货币符号、全角点、空白等输入。
+    """
     if pd.isna(value):
         return None
 
+    s = unicodedata.normalize("NFKC", str(value)).strip()
+    if not s:
+        return None
+
+    # 千分位逗号去掉（避免 Decimal 解析失败）
+    s = s.replace(",", "")
+
+    # 替换全角点为半角点（NFKC理论上已转半角，但这里再保险）
+    s = s.replace("．", ".")
+    s = s.replace("。", ".")
+
+    # 提取第一个“看起来像数字”的片段：允许负号、整数或小数
+    m = re.search(r"[-]?\d+(\.\d+)?", s)
+    if not m:
+        return None
+
+    num_str = m.group(0)
+
     try:
-        cleaned_value = str(value).strip().replace(",", "")
-
-        # 兼容部分数据源以括号表示负数，例如 (1,234.56)。
-        if (
-            cleaned_value.startswith("(")
-            and cleaned_value.endswith(")")
-        ):
-            cleaned_value = "-" + cleaned_value[1:-1]
-
-        amount = Decimal(cleaned_value).quantize(
+        amt = Decimal(num_str).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP
         )
-        return int(amount * 100)
+        return int(amt * 100)
     except Exception:
         return None
 
 
 def format_money_from_cents(cents):
     """将整数分转换为固定两位小数的字符串。"""
+    if cents is None:
+        return None
     return f"{Decimal(int(cents)) / Decimal(100):.2f}"
 
 
 def format_unique_field(record_list, field_name):
-    """去除空值，并按照原顺序去重拼接。"""
+    """去除空值并按原顺序去重拼接。"""
     valid_values = []
     seen = set()
 
@@ -108,32 +124,25 @@ def format_unique_field(record_list, field_name):
 
 def find_best_subset(records, target, max_items):
     """
-    寻找金额合计严格等于 target 的记录组合。
+    在 records 中寻找金额合计等于 target 的组合（整数分精确匹配）。
 
-    规则：
+    返回规则：
     1. 优先使用记录数量最少的组合；
-    2. 相同数量时，按金额降序和内部行号返回第一个组合；
-    3. 常规组合只使用正金额记录；
-    4. target 为 0 时，允许匹配一笔零金额记录。
+    2. 相同数量时，按金额降序及内部行号返回第一个组合。
     """
     if target < 0:
         return None
 
-    positive_records = [
-        record for record in records
-        if record["amount"] > 0
-    ]
-    zero_records = [
-        record for record in records
-        if record["amount"] == 0
-    ]
+    positive_records = [r for r in records if r["amount"] > 0]
+    zero_records = [r for r in records if r["amount"] == 0]
 
     if target == 0:
         return [zero_records[0]] if zero_records else None
 
+    # 金额降序，行号升序
     sorted_records = sorted(
         positive_records,
-        key=lambda record: (-record["amount"], record["row_id"])
+        key=lambda r: (-r["amount"], r["row_id"])
     )
 
     record_count = len(sorted_records)
@@ -142,7 +151,6 @@ def find_best_subset(records, target, max_items):
 
     max_items = min(max_items, record_count)
 
-    # 先找 1 笔，再找 2 笔，以此类推。
     for required_count in range(1, max_items + 1):
         result = None
 
@@ -152,40 +160,41 @@ def find_best_subset(records, target, max_items):
             if result is not None:
                 return
 
-            slots_left = required_count - len(current_subset)
+            selected_count = len(current_subset)
+            slots_left = required_count - selected_count
 
             if slots_left == 0:
                 if remaining == 0:
                     result = list(current_subset)
                 return
 
-            available_count = record_count - start_index
-            if available_count < slots_left or remaining < 0:
+            if record_count - start_index < slots_left:
                 return
 
-            # 只用当前递归位置之后仍然可选的记录计算上下界。
-            remaining_records = sorted_records[start_index:]
+            if remaining < 0:
+                return
 
+            # 剪枝：最大/最小可能合计
             max_possible = sum(
-                record["amount"]
-                for record in remaining_records[:slots_left]
+                sorted_records[i]["amount"]
+                for i in range(start_index, start_index + slots_left)
             )
             min_possible = sum(
-                record["amount"]
-                for record in remaining_records[-slots_left:]
+                sorted_records[i]["amount"]
+                for i in range(record_count - slots_left, record_count)
             )
 
             if remaining > max_possible or remaining < min_possible:
                 return
 
             last_amount = None
-            maximum_index = record_count - slots_left
 
-            for index in range(start_index, maximum_index + 1):
+            # 枚举选择
+            for index in range(start_index, record_count - slots_left + 1):
                 record = sorted_records[index]
                 amount = record["amount"]
 
-                # 同一递归层跳过相同金额，避免重复搜索。
+                # 同一递归层跳过相同金额，减少重复搜索
                 if last_amount is not None and amount == last_amount:
                     continue
                 last_amount = amount
@@ -220,13 +229,9 @@ df_payment = Alteryx.read("#2")
 # ==========================================
 if "proposal_key" not in df_proposal.columns:
     if "Record" in df_proposal.columns:
-        df_proposal = df_proposal.rename(
-            columns={"Record": "proposal_key"}
-        )
+        df_proposal = df_proposal.rename(columns={"Record": "proposal_key"})
     else:
-        raise ValueError(
-            "Proposal 输入缺少 proposal_key 或 Record 字段。"
-        )
+        raise ValueError("Proposal 输入缺少 proposal_key 或 Record 字段。")
 
 if "Record" in df_payment.columns:
     df_payment = df_payment.drop(columns=["Record"])
@@ -243,25 +248,16 @@ required_payment_columns = [
 ]
 
 missing_proposal_columns = [
-    column for column in required_proposal_columns
-    if column not in df_proposal.columns
+    c for c in required_proposal_columns if c not in df_proposal.columns
 ]
 missing_payment_columns = [
-    column for column in required_payment_columns
-    if column not in df_payment.columns
+    c for c in required_payment_columns if c not in df_payment.columns
 ]
 
 if missing_proposal_columns:
-    raise ValueError(
-        "Proposal 输入缺少字段："
-        + ", ".join(missing_proposal_columns)
-    )
-
+    raise ValueError("Proposal 输入缺少字段：" + ", ".join(missing_proposal_columns))
 if missing_payment_columns:
-    raise ValueError(
-        "Payment 输入缺少字段："
-        + ", ".join(missing_payment_columns)
-    )
+    raise ValueError("Payment 输入缺少字段：" + ", ".join(missing_payment_columns))
 
 optional_payment_columns = [
     "Debit Account",
@@ -269,13 +265,13 @@ optional_payment_columns = [
     "Debtor Agent Party ID"
 ]
 
-for column in optional_payment_columns:
-    if column not in df_payment.columns:
-        df_payment[column] = None
+for col in optional_payment_columns:
+    if col not in df_payment.columns:
+        df_payment[col] = None
 
 
 # ==========================================
-# 4. 创建内部行号并清洗数据
+# 4. 创建内部唯一行号并清洗数据
 # ==========================================
 df_proposal = df_proposal.copy()
 df_payment = df_payment.copy()
@@ -283,60 +279,35 @@ df_payment = df_payment.copy()
 df_proposal["_proposal_row_id"] = range(len(df_proposal))
 df_payment["_payment_row_id"] = range(len(df_payment))
 
-df_proposal["_client_match_key"] = (
-    df_proposal["Buyer Name (Local)"].apply(normalize_name)
-)
-df_payment["_client_match_key"] = (
-    df_payment["Client_Name"].apply(normalize_name)
-)
+df_proposal["_client_match_key"] = df_proposal["Buyer Name (Local)"].apply(normalize_name)
+df_payment["_client_match_key"] = df_payment["Client_Name"].apply(normalize_name)
 
-df_proposal["_amount_cents"] = (
-    df_proposal["Proposal Total Amount"].apply(to_cents)
-)
-df_payment["_amount_cents"] = (
-    df_payment["Yesterday_Balance"].apply(to_cents)
-)
+# 为诊断先保留 raw（可选）
+if ENABLE_DEBUG_DIAGNOSTICS:
+    df_proposal["_debug_proposal_raw_amount"] = df_proposal["Proposal Total Amount"]
+    df_payment["_debug_payment_raw_amount"] = df_payment["Yesterday_Balance"]
+    df_proposal["_debug_proposal_raw_name"] = df_proposal["Buyer Name (Local)"]
+    df_payment["_debug_payment_raw_name"] = df_payment["Client_Name"]
 
-# 保留可视化诊断字段，帮助确认两边匹配键和金额分值。
-if KEEP_DEBUG_COLUMNS:
-    df_proposal["DEBUG_Client_Key"] = df_proposal["_client_match_key"]
-    df_proposal["DEBUG_Amount_Cents"] = df_proposal["_amount_cents"]
-    df_proposal["DEBUG_Name_Length"] = (
-        df_proposal["Buyer Name (Local)"].apply(
-            lambda value: None if pd.isna(value) else len(str(value))
-        )
-    )
+# 金额转分
+df_proposal["_amount_cents"] = df_proposal["Proposal Total Amount"].apply(to_cents)
+df_payment["_amount_cents"] = df_payment["Yesterday_Balance"].apply(to_cents)
 
-    df_payment["DEBUG_Client_Key"] = df_payment["_client_match_key"]
-    df_payment["DEBUG_Amount_Cents"] = df_payment["_amount_cents"]
-    df_payment["DEBUG_Name_Length"] = (
-        df_payment["Client_Name"].apply(
-            lambda value: None if pd.isna(value) else len(str(value))
-        )
-    )
-
+# 仅对关键字段 dropna
 df_proposal_clean = df_proposal.dropna(
-    subset=[
-        "proposal_key",
-        "_client_match_key",
-        "_amount_cents"
-    ]
+    subset=["proposal_key", "_client_match_key", "_amount_cents"]
 ).copy()
-
 df_payment_clean = df_payment.dropna(
-    subset=[
-        "payment_key",
-        "_client_match_key",
-        "_amount_cents"
-    ]
+    subset=["payment_key", "_client_match_key", "_amount_cents"]
 ).copy()
 
-df_proposal_clean["_amount_cents"] = (
-    df_proposal_clean["_amount_cents"].astype(int)
-)
-df_payment_clean["_amount_cents"] = (
-    df_payment_clean["_amount_cents"].astype(int)
-)
+df_proposal_clean["_amount_cents"] = df_proposal_clean["_amount_cents"].astype(int)
+df_payment_clean["_amount_cents"] = df_payment_clean["_amount_cents"].astype(int)
+
+if ENABLE_DEBUG_DIAGNOSTICS:
+    # 再保留用于定位的诊断信息（不改变后续逻辑）
+    df_proposal_clean["_debug_proposal_amount_cents"] = df_proposal_clean["_amount_cents"]
+    df_payment_clean["_debug_payment_amount_cents"] = df_payment_clean["_amount_cents"]
 
 
 # ==========================================
@@ -360,55 +331,24 @@ def save_match(proposal_records, payment_records):
     else:
         match_type = "Many-to-Many"
 
-    proposal_sum_cents = sum(
-        proposal["amount"] for proposal in proposal_records
-    )
-    payment_sum_cents = sum(
-        payment["amount"] for payment in payment_records
-    )
+    target_cents = sum(p["amount"] for p in proposal_records)
 
-    # 防御性检查：不允许保存不平衡的匹配。
-    if proposal_sum_cents != payment_sum_cents:
-        raise ValueError(
-            "尝试保存金额不平衡的匹配："
-            f"Proposal={proposal_sum_cents}, "
-            f"Payment={payment_sum_cents}"
-        )
+    payment_ids_string = ", ".join(str(p["id"]) for p in payment_records)
+    payment_amounts_string = ", ".join(format_money_from_cents(p["amount"]) for p in payment_records)
+    proposal_ids_string = ", ".join(str(pr["id"]) for pr in proposal_records)
 
-    payment_ids_string = ", ".join(
-        str(payment["id"]) for payment in payment_records
-    )
-    payment_amounts_string = ", ".join(
-        format_money_from_cents(payment["amount"])
-        for payment in payment_records
-    )
-    proposal_ids_string = ", ".join(
-        str(proposal["id"]) for proposal in proposal_records
-    )
+    debit_account_string = format_unique_field(payment_records, "Debit Account")
+    debtor_agent_name_string = format_unique_field(payment_records, "Debtor_Agent_Name")
+    debtor_agent_party_id_string = format_unique_field(payment_records, "Debtor Agent Party ID")
 
     result = {
         "Matched_Payment_IDs": payment_ids_string,
         "Matched_Payment_Amounts": payment_amounts_string,
-        "Matched_Debit_Account": format_unique_field(
-            payment_records,
-            "Debit Account"
-        ),
-        "Matched_Debtor_Agent_Name": format_unique_field(
-            payment_records,
-            "Debtor_Agent_Name"
-        ),
-        "Matched_Debtor_Agent_Party_ID": format_unique_field(
-            payment_records,
-            "Debtor Agent Party ID"
-        ),
-        "Group_Matched_Proposals": (
-            proposal_ids_string if proposal_count > 1 else None
-        ),
-        "Group_Target_Sum": (
-            proposal_sum_cents / 100.0
-            if proposal_count > 1
-            else None
-        ),
+        "Matched_Debit_Account": debit_account_string,
+        "Matched_Debtor_Agent_Name": debtor_agent_name_string,
+        "Matched_Debtor_Agent_Party_ID": debtor_agent_party_id_string,
+        "Group_Matched_Proposals": proposal_ids_string if proposal_count > 1 else None,
+        "Group_Target_Sum": (target_cents / 100.0) if proposal_count > 1 else None,
         "Match_Type": match_type,
         "Matched_Proposal_Count": proposal_count,
         "Matched_Payment_Count": payment_count
@@ -424,85 +364,64 @@ def save_match(proposal_records, payment_records):
 # ==========================================
 # 6. 按标准化客户名称执行匹配
 # ==========================================
-for client_key, proposal_group in df_proposal_clean.groupby(
-    "_client_match_key",
-    sort=False
-):
-    payment_group = df_payment_clean[
-        df_payment_clean["_client_match_key"] == client_key
-    ]
+for client_key, proposal_group in df_proposal_clean.groupby("_client_match_key", sort=False):
+    payment_group = df_payment_clean[df_payment_clean["_client_match_key"] == client_key]
 
     if payment_group.empty:
         continue
 
-    available_proposals = [
-        {
+    available_proposals = []
+    for _, row in proposal_group.iterrows():
+        available_proposals.append({
             "row_id": int(row["_proposal_row_id"]),
             "id": row["proposal_key"],
             "amount": int(row["_amount_cents"])
-        }
-        for _, row in proposal_group.iterrows()
-    ]
+        })
 
-    available_payments = [
-        {
+    available_payments = []
+    for _, row in payment_group.iterrows():
+        available_payments.append({
             "row_id": int(row["_payment_row_id"]),
             "id": row["payment_key"],
             "amount": int(row["_amount_cents"]),
             "Debit Account": row["Debit Account"],
             "Debtor_Agent_Name": row["Debtor_Agent_Name"],
             "Debtor Agent Party ID": row["Debtor Agent Party ID"]
-        }
-        for _, row in payment_group.iterrows()
-    ]
+        })
 
-    available_proposals.sort(
-        key=lambda record: (-record["amount"], record["row_id"])
-    )
-    available_payments.sort(
-        key=lambda record: (-record["amount"], record["row_id"])
-    )
+    # 排序：金额降序，row_id升序
+    available_proposals.sort(key=lambda r: (-r["amount"], r["row_id"]))
+    available_payments.sort(key=lambda r: (-r["amount"], r["row_id"]))
 
-    # --------------------------------------
-    # 阶段 A：一对一
-    # --------------------------------------
+    # --------------------------------------------------
+    # 阶段 A：同金额一对一
+    # --------------------------------------------------
     progress = True
-
     while progress and available_proposals and available_payments:
         progress = False
 
-        for proposal in list(available_proposals):
-            matched_payment = next(
-                (
-                    payment
-                    for payment in available_payments
-                    if payment["amount"] == proposal["amount"]
-                ),
-                None
-            )
+        # 用更快的金额索引（避免在 list 里 next 搜）
+        payment_by_amount = {}
+        for pay in available_payments:
+            payment_by_amount.setdefault(pay["amount"], []).append(pay)
 
-            if matched_payment is None:
+        for proposal in list(available_proposals):
+            if proposal["amount"] not in payment_by_amount:
                 continue
 
+            matched_payment = payment_by_amount[proposal["amount"]][0]
+            # 保存
             save_match([proposal], [matched_payment])
 
-            available_proposals = [
-                item for item in available_proposals
-                if item["row_id"] != proposal["row_id"]
-            ]
-            available_payments = [
-                item for item in available_payments
-                if item["row_id"] != matched_payment["row_id"]
-            ]
-
+            available_proposals = [p for p in available_proposals if p["row_id"] != proposal["row_id"]]
+            available_payments = [p for p in available_payments if p["row_id"] != matched_payment["row_id"]]
             progress = True
             break
 
-    # --------------------------------------
-    # 阶段 B：多 Proposal 对一 Payment
-    # --------------------------------------
+    # --------------------------------------------------
+    # 阶段 B：一笔 Payment 匹配多笔 Proposal（proposal>=2）
+    # --------------------------------------------------
     progress = True
-
     while progress and available_proposals and available_payments:
         progress = False
 
@@ -518,26 +437,17 @@ for client_key, proposal_group in df_proposal_clean.groupby(
 
             save_match(proposal_subset, [payment])
 
-            used_proposal_rows = {
-                proposal["row_id"] for proposal in proposal_subset
-            }
-            available_proposals = [
-                proposal for proposal in available_proposals
-                if proposal["row_id"] not in used_proposal_rows
-            ]
-            available_payments = [
-                item for item in available_payments
-                if item["row_id"] != payment["row_id"]
-            ]
+            used_proposal_rows = {p["row_id"] for p in proposal_subset}
+            available_proposals = [p for p in available_proposals if p["row_id"] not in used_proposal_rows]
+            available_payments = [pay for pay in available_payments if pay["row_id"] != payment["row_id"]]
 
             progress = True
             break
 
-    # --------------------------------------
-    # 阶段 C：一 Proposal 对多 Payment
-    # --------------------------------------
+    # --------------------------------------------------
+    # 阶段 C：一笔 Proposal 匹配多笔 Payment（payment>=2）
+    # --------------------------------------------------
     progress = True
-
     while progress and available_proposals and available_payments:
         progress = False
 
@@ -553,43 +463,27 @@ for client_key, proposal_group in df_proposal_clean.groupby(
 
             save_match([proposal], payment_subset)
 
-            available_proposals = [
-                item for item in available_proposals
-                if item["row_id"] != proposal["row_id"]
-            ]
-            used_payment_rows = {
-                payment["row_id"] for payment in payment_subset
-            }
-            available_payments = [
-                payment for payment in available_payments
-                if payment["row_id"] not in used_payment_rows
-            ]
+            available_proposals = [p for p in available_proposals if p["row_id"] != proposal["row_id"]]
+            used_payment_rows = {pay["row_id"] for pay in payment_subset}
+            available_payments = [pay for pay in available_payments if pay["row_id"] not in used_payment_rows]
 
             progress = True
             break
 
-    # --------------------------------------
-    # 阶段 D：多 Proposal 对多 Payment
-    # --------------------------------------
+    # --------------------------------------------------
+    # 阶段 D：多 Proposal 对多 Payment（双方>=2）
+    # --------------------------------------------------
     progress = True
-
     while progress and available_proposals and available_payments:
         progress = False
-        maximum_proposal_count = min(
-            MAX_PROPOSALS_PER_MATCH,
-            len(available_proposals)
-        )
+
+        maximum_proposal_count = min(MAX_PROPOSALS_PER_MATCH, len(available_proposals))
 
         for proposal_count in range(2, maximum_proposal_count + 1):
             matched_at_this_level = False
 
-            for proposal_combo in combinations(
-                available_proposals,
-                proposal_count
-            ):
-                target_cents = sum(
-                    proposal["amount"] for proposal in proposal_combo
-                )
+            for proposal_combo in combinations(available_proposals, proposal_count):
+                target_cents = sum(p["amount"] for p in proposal_combo)
 
                 payment_subset = find_best_subset(
                     available_payments,
@@ -602,21 +496,11 @@ for client_key, proposal_group in df_proposal_clean.groupby(
 
                 save_match(list(proposal_combo), payment_subset)
 
-                used_proposal_rows = {
-                    proposal["row_id"] for proposal in proposal_combo
-                }
-                used_payment_rows = {
-                    payment["row_id"] for payment in payment_subset
-                }
+                used_proposal_rows = {p["row_id"] for p in proposal_combo}
+                used_payment_rows = {pay["row_id"] for pay in payment_subset}
 
-                available_proposals = [
-                    proposal for proposal in available_proposals
-                    if proposal["row_id"] not in used_proposal_rows
-                ]
-                available_payments = [
-                    payment for payment in available_payments
-                    if payment["row_id"] not in used_payment_rows
-                ]
+                available_proposals = [p for p in available_proposals if p["row_id"] not in used_proposal_rows]
+                available_payments = [pay for pay in available_payments if pay["row_id"] not in used_payment_rows]
 
                 progress = True
                 matched_at_this_level = True
@@ -634,7 +518,10 @@ def get_match_value(proposal_row_id, column_name):
         return None
 
     result = match_results.get(int(proposal_row_id))
-    return None if result is None else result.get(column_name)
+    if result is None:
+        return None
+
+    return result.get(column_name)
 
 
 result_columns = [
@@ -652,7 +539,7 @@ result_columns = [
 
 for column_name in result_columns:
     df_proposal[column_name] = df_proposal["_proposal_row_id"].apply(
-        lambda row_id, column=column_name: get_match_value(row_id, column)
+        lambda rid, col=column_name: get_match_value(rid, col)
     )
 
 
@@ -672,32 +559,33 @@ proposal_internal_columns = [
     "_client_match_key",
     "_amount_cents"
 ]
+
 payment_internal_columns = [
     "_payment_row_id",
     "_client_match_key",
     "_amount_cents"
 ]
 
-df_proposal = df_proposal.drop(
-    columns=[
-        column for column in proposal_internal_columns
-        if column in df_proposal.columns
-    ]
-)
+df_proposal = df_proposal.drop(columns=[c for c in proposal_internal_columns if c in df_proposal.columns])
+df_unmatched_payments = df_unmatched_payments.drop(columns=[c for c in payment_internal_columns if c in df_unmatched_payments.columns])
 
-df_unmatched_payments = df_unmatched_payments.drop(
-    columns=[
-        column for column in payment_internal_columns
-        if column in df_unmatched_payments.columns
+# 如果你不想留诊断字段，可以在这里加删列逻辑
+if not ENABLE_DEBUG_DIAGNOSTICS:
+    diag_cols = [
+        "_debug_proposal_raw_amount",
+        "_debug_payment_raw_amount",
+        "_debug_proposal_raw_name",
+        "_debug_payment_raw_name"
     ]
-)
+    for col in diag_cols:
+        if col in df_proposal.columns:
+            df_proposal = df_proposal.drop(columns=[col])
+        if col in df_unmatched_payments.columns:
+            df_unmatched_payments = df_unmatched_payments.drop(columns=[col])
 
 
 # ==========================================
 # 10. 写入 Alteryx 输出端口
 # ==========================================
-# 端口 1：全部 Proposal 以及匹配结果。
 Alteryx.write(df_proposal, 1)
-
-# 端口 2：未匹配的 Payment，并保留诊断字段。
 Alteryx.write(df_unmatched_payments, 2)
