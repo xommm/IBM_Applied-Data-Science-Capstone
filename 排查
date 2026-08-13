@@ -1,0 +1,197 @@
+from ayx import Alteryx
+import pandas as pd
+import numpy as np
+import re
+import unicodedata
+from decimal import Decimal, ROUND_HALF_UP
+
+# ==========================================
+# 0. 排查配置项
+# ==========================================
+# 填入你要排查的目标公司关键词（支持模糊搜索，如 "联合利华"）
+TARGET_KEYWORD = "联合利华"
+
+# ==========================================
+# 1. 清洗与转换函数定义
+# ==========================================
+def normalize_name_strict(value):
+    if pd.isna(value): return None
+    s = str(value).replace("\x00", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFKC", s).strip()
+    if not text: return None
+    text = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", text)
+    text = re.sub(r"\s+", "", text).lower()
+    text = text.replace("（", "(").replace("）", ")")
+    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\(\)\-\,\.\u00b7]", "", text)
+    return text if text else None
+
+def normalize_name_fuzzy(value):
+    if pd.isna(value): return None
+    s = str(value).replace("\x00", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFKC", s).strip().lower()
+    if not text: return None
+    text = re.sub(r"[^\w\u4e00-\u9fff]", "", text)
+    suffixes = ["有限责任公司", "股份有限公司", "有限公司", "责任公司", "分公司", "公司", "中国", "上海分行", "分行"]
+    for sfx in suffixes:
+        text = text.replace(sfx, "")
+    return text if text else None
+
+def normalize_name_aggressive(value):
+    if pd.isna(value): return None
+    s = str(value).replace("\x00", "").replace("\ufeff", "")
+    text = unicodedata.normalize("NFKC", s).strip().lower()
+    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", text)
+    return text if text else None
+
+def to_cents(value):
+    if pd.isna(value): return None
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value) or np.isinf(value): return None
+        num_str = f"{value:.2f}"
+    elif isinstance(value, (int, np.integer)):
+        num_str = str(value)
+    else:
+        s = unicodedata.normalize("NFKC", str(value)).strip()
+        if not s: return None
+        s = s.replace("\x00", "").replace("\ufeff", "").replace(",", "")
+        s = s.replace("￥", "").replace("$", "").replace("¥", "").replace("CNY", "")
+        s = s.replace("．", ".").replace("。", ".")
+        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1]
+        m = re.search(r"[-]?\d+(\.\d+)?([eE][+-]?\d+)?", s)
+        if not m: return None
+        num_str = m.group(0)
+    try:
+        amt = Decimal(num_str).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return int(amt * 100)
+    except Exception:
+        return None
+
+# ==========================================
+# 2. 读取数据并筛选目标关键词
+# ==========================================
+df_prop_raw = Alteryx.read("#1")
+df_pay_raw = Alteryx.read("#2")
+
+df_prop_raw.columns = [str(c).strip() for c in df_prop_raw.columns]
+df_pay_raw.columns = [str(c).strip() for c in df_pay_raw.columns]
+
+# 筛选包含目标关键词的记录
+mask_prop = df_prop_raw["Buyer Name (Local)"].astype(str).str.contains(TARGET_KEYWORD, case=False, na=False)
+mask_pay = df_pay_raw["Client_Name"].astype(str).str.contains(TARGET_KEYWORD, case=False, na=False)
+
+df_prop = df_prop_raw[mask_prop].copy()
+df_pay = df_pay_raw[mask_pay].copy()
+
+# 诊断日志列表
+diag_logs = []
+
+def add_diag(check_item, status, message):
+    diag_logs.append({"检查项目": check_item, "诊断结果": status, "详细说明": message})
+
+print(f"=== [诊断开始：目标关键词 '{TARGET_KEYWORD}'] ===")
+
+# ==========================================
+# 排查 1: 原始数据与 Null/缺失值校验
+# ==========================================
+if df_prop.empty:
+    add_diag("1. 原始数据检索", "FAIL", f"Proposal (#1) 中未查找到包含 '{TARGET_KEYWORD}' 的记录！")
+if df_pay.empty:
+    add_diag("2. 原始数据检索", "FAIL", f"Payment (#2) 中未查找到包含 '{TARGET_KEYWORD}' 的记录！")
+
+if not df_prop.empty and not df_pay.empty:
+    add_diag("1. 原始数据检索", "PASS", f"检索成功！Proposal 查到 {len(df_prop)} 条，Payment 查到 {len(df_pay)} 条。")
+    
+    # 检查是否有关键字段缺失
+    prop_nulls = df_prop["Proposal Total Amount"].isna().sum()
+    pay_nulls = df_pay["Yesterday_Balance"].isna().sum()
+    if prop_nulls > 0 or pay_nulls > 0:
+        add_diag("2. Null值过滤检查", "WARN", f"发现空金额！Proposal 有 {prop_nulls} 条金额为空，Payment 有 {pay_nulls} 条金额为空（可能在清洗时被丢弃）。")
+    else:
+        add_diag("2. Null值过滤检查", "PASS", "所有目标的金额字段完整，未触发 dropna 过滤。")
+
+    # ==========================================
+    # 排查 2: 名称 Key 匹配分析（最重要的看点）
+    # ==========================================
+    df_prop["strict_key"] = df_prop["Buyer Name (Local)"].apply(normalize_name_strict)
+    df_pay["strict_key"] = df_pay["Client_Name"].apply(normalize_name_strict)
+    
+    df_prop["fuzzy_key"] = df_prop["Buyer Name (Local)"].apply(normalize_name_fuzzy)
+    df_pay["fuzzy_key"] = df_pay["Client_Name"].apply(normalize_name_fuzzy)
+    
+    df_prop["aggressive_key"] = df_prop["Buyer Name (Local)"].apply(normalize_name_aggressive)
+    df_pay["aggressive_key"] = df_pay["Client_Name"].apply(normalize_name_aggressive)
+
+    prop_strict = set(df_prop["strict_key"].dropna().unique())
+    pay_strict = set(df_pay["strict_key"].dropna().unique())
+    
+    prop_fuzzy = set(df_fuzzy for df_fuzzy in df_prop["fuzzy_key"].dropna().unique())
+    pay_fuzzy = set(pay_fuzzy for pay_fuzzy in df_pay["fuzzy_key"].dropna().unique())
+
+    strict_overlap = prop_strict.intersection(pay_strict)
+    fuzzy_overlap = prop_fuzzy.intersection(pay_fuzzy)
+
+    if strict_overlap:
+        add_diag("3. 客户名称 Key 检查", "PASS", f"Strict Key 完美匹配！匹配 Key: {strict_overlap}")
+    elif fuzzy_overlap:
+        add_diag("3. 客户名称 Key 检查", "PASS (Fuzzy)", f"Fuzzy Key 模糊匹配成功！匹配 Key: {fuzzy_overlap}。原名比对: Proposal={set(df_prop['Buyer Name (Local)'])}, Payment={set(df_pay['Client_Name'])}")
+    else:
+        msg = f"❌ 名称 Key 无法对接！分组失败！\n" \
+              f" - Proposal 的 Fuzzy Key: {prop_fuzzy}\n" \
+              f" - Payment 的 Fuzzy Key: {pay_fuzzy}\n" \
+              f"【根本原因】：因为分组 Key 不一致，代码认为它们是两家不同的公司，根本没有进入后续金额对比逻辑！"
+        add_diag("3. 客户名称 Key 检查", "FAIL", msg)
+
+    # ==========================================
+    # 排查 3: 金额精度转换与负数/折扣项检查
+    # ==========================================
+    df_prop["cents"] = df_prop["Proposal Total Amount"].apply(to_cents)
+    df_pay["cents"] = df_pay["Yesterday_Balance"].apply(to_cents)
+
+    neg_proposals = df_prop[df_prop["cents"] <= 0]
+    if not neg_proposals.empty:
+        add_diag("4. 负数/折扣单据检查", "WARN", f"发现 {len(neg_proposals)} 笔 Proposal 金额 <= 0 (金额: {list(neg_proposals['Proposal Total Amount'])})。注意：find_best_subset 会自动忽略 <=0 的记录！")
+    else:
+        add_diag("4. 负数/折扣单据检查", "PASS", "没有发现 <= 0 的负数/红字单据。")
+
+    # ==========================================
+    # 排查 4: 汇总金额与组合求和测试 (Cents 精确匹配)
+    # ==========================================
+    pos_prop_cents = df_prop[df_prop["cents"] > 0]["cents"].tolist()
+    total_prop_cents = sum(pos_prop_cents)
+    
+    for idx, pay_row in df_pay.iterrows():
+        pay_cents = pay_row["cents"]
+        pay_raw_amt = pay_row["Yesterday_Balance"]
+        pay_id = pay_row.get("payment_key", pay_row.get("Record", idx))
+
+        diff_cents = total_prop_cents - pay_cents
+        
+        if pay_cents == total_prop_cents:
+            add_diag(f"5. 金额比对 [Payment ID: {pay_id}]", "PASS", f"Proposal 正数总和 ({total_prop_cents}分) == Payment 金额 ({pay_cents}分)。金额 100% 精确对齐！")
+        else:
+            diff_yuan = diff_cents / 100.0
+            msg = f"金额存在偏差！\n" \
+                  f" - Proposal 汇总金额: {total_prop_cents / 100.0:.2f} 元 ({total_prop_cents} 分)\n" \
+                  f" - Payment 目标金额: {pay_cents / 100.0:.2f} 元 ({pay_cents} 分)\n" \
+                  f" - 差额: {diff_yuan:.2f} 元 ({diff_cents} 分)。\n" \
+                  f"【结论】：因算法要求‘分’级别的绝对零误差，差了 {diff_cents} 分导致匹配返回失败！"
+            add_diag(f"5. 金额比对 [Payment ID: {pay_id}]", "FAIL", msg)
+
+# ==========================================
+# 3. 输出诊断报告到 Alteryx 端口
+# ==========================================
+df_report = pd.DataFrame(diag_logs)
+
+# 端口 1: 打印诊断分析结论表
+Alteryx.write(df_report, 1)
+
+# 端口 2: 将清洗后的比对明细列出来（供人工查看名称 Key 和分级转换）
+df_prop_summary = df_prop[["Buyer Name (Local)", "strict_key", "fuzzy_key", "Proposal Total Amount", "cents"]].copy() if not df_prop.empty else pd.DataFrame()
+df_pay_summary = df_pay[["Client_Name", "strict_key", "fuzzy_key", "Yesterday_Balance", "cents"]].copy() if not df_pay.empty else pd.DataFrame()
+
+df_comb_detail = pd.concat([
+    df_prop_summary.assign(数据来源="Proposal (#1)"),
+    df_pay_summary.assign(数据来源="Payment (#2)")
+], ignore_index=True)
+
+Alteryx.write(df_comb_detail, 2)
