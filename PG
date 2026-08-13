@@ -1,88 +1,96 @@
+from ayx import Alteryx
 import pandas as pd
 import numpy as np
+from itertools import combinations
 
-df1 = Alteryx.read("#1").to_dataframe()  # 完整信息表
-df2 = Alteryx.read("#2").to_dataframe()  # Paymentgroup表
+# 1. 读取输入数据
+# 请确保输入 1 连接至 Anchor #1，输入 2 连接至 Anchor #2
+df1 = Alteryx.read("#1")
+df2 = Alteryx.read("#2")
 
-# -------------------------
-# 字段名（按你提供的）
-# -------------------------
-col1_ibr = "Internal Buyer Reference"
-col1_amt = "Proposal Total Amount"
-col1_drawee = "Buyer Name (Local)"  # Input1里的 Drawee 名称
+# 2. 数据预处理（转换金额列为数值型，防止字符串影响计算）
+df1['Proposal Total Amount'] = pd.to_numeric(df1['Proposal Total Amount'], errors='coerce').fillna(0)
+df2['Payment Net Amount'] = pd.to_numeric(df2['Payment Net Amount'], errors='coerce').fillna(0)
 
-col2_pgr = "Payment Group Reference"
-col2_amt = "Payment Net Amount"
-col2_drawee = "Drawee (Local)"      # 如果 Input2 也叫 Buyer Name (Local)，把这一行改掉
-col2_ibr = "Internal Buyer Reference"
+# 初始化目标字段
+df1['Payment Group Reference'] = None
 
-out_col = "Payment Group Reference"
+# 定义子集组合求和匹配函数 (1个Payment金额 对 多个Proposal金额)
+def find_subset_match(proposal_items, target_amount, tolerance=0.01):
+    """
+    proposal_items: [(df1_index, amount), ...]
+    target_amount: 目标 Payment 金额
+    tolerance: 容差范围（用于处理浮点数精度误差）
+    """
+    n = len(proposal_items)
+    # 限制组合元素个数最大为 10，防止暴搜耗时过长（可调整）
+    max_comb_length = min(n, 10) 
+    
+    for r in range(2, max_comb_length + 1):
+        for combo in combinations(proposal_items, r):
+            combo_sum = sum(item[1] for item in combo)
+            if abs(combo_sum - target_amount) <= tolerance:
+                return [item[0] for item in combo] # 返回匹配到的 df1 索引列表
+    return None
 
-# -------------------------
-# 金额标准化
-# -------------------------
-df1["_amt"] = pd.to_numeric(df1[col1_amt], errors="coerce")
-df2["_amt"] = pd.to_numeric(df2[col2_amt], errors="coerce")
+# 3. 按 Internal Buyer Reference 分组处理匹配逻辑
+for ref, group1 in df1.groupby('Internal Buyer Reference'):
+    if pd.isna(ref) or str(ref).strip() == '':
+        continue
+        
+    group1_indices = group1.index.tolist()
+    group2 = df2[df2['Internal Buyer Reference'] == ref]
+    
+    # 场景 A: 输入 2 中未找到匹配的 Reference
+    if group2.empty:
+        continue
+        
+    # 场景 B: 仅找到唯一一条 Payment 记录（无歧义，直接映射）
+    if len(group2) == 1:
+        pay_ref = group2.iloc[0]['Payment Group Reference']
+        df1.loc[group1_indices, 'Payment Group Reference'] = pay_ref
+        continue
+        
+    # 场景 C: 存在多条 Payment 记录（存在冲突/多 Drawee 情况），启动金额匹配机制
+    unmatched_df1 = group1.copy()
+    unmatched_df2 = group2.copy()
+    
+    # ---------------- 步骤 C1: 1v1 金额匹配 ----------------
+    matched_df2_indices = []
+    for idx2, row2 in unmatched_df2.iterrows():
+        target_amt = row2['Payment Net Amount']
+        pay_ref = row2['Payment Group Reference']
+        
+        # 查找 Proposal 中金额完全相等的行
+        matches_1v1 = unmatched_df1[np.isclose(unmatched_df1['Proposal Total Amount'], target_amt, atol=0.01)]
+        if not matches_1v1.empty:
+            matched_idx1 = matches_1v1.index[0] # 取第1个匹配项
+            df1.loc[matched_idx1, 'Payment Group Reference'] = pay_ref
+            
+            # 从待匹配池中移除已匹配项
+            unmatched_df1 = unmatched_df1.drop(matched_idx1)
+            matched_df2_indices.append(idx2)
+            
+    unmatched_df2 = unmatched_df2.drop(matched_df2_indices)
+    
+    # ---------------- 步骤 C2: 1对多（1个 Payment 对 多个 Proposal）组合匹配 ----------------
+    for idx2, row2 in unmatched_df2.iterrows():
+        if unmatched_df1.empty:
+            break
+            
+        target_amt = row2['Payment Net Amount']
+        pay_ref = row2['Payment Group Reference']
+        
+        # 准备剩余 Proposal 的 (索引, 金额) 列表
+        proposal_items = [(idx1, row1['Proposal Total Amount']) for idx1, row1 in unmatched_df1.iterrows() if row1['Proposal Total Amount'] > 0]
+        
+        # 计算组合求和
+        matched_indices = find_subset_match(proposal_items, target_amt)
+        if matched_indices:
+            # 将匹配到的所有 Proposal 全部追加同一个 Payment Group Reference
+            df1.loc[matched_indices, 'Payment Group Reference'] = pay_ref
+            # 从待匹配池中移除
+            unmatched_df1 = unmatched_df1.drop(matched_indices)
 
-ROUND_DECIMALS = 2
-df1["_amt_r"] = df1["_amt"].round(ROUND_DECIMALS)
-df2["_amt_r"] = df2["_amt"].round(ROUND_DECIMALS)
-
-# -------------------------
-# 初始化输出列
-# -------------------------
-df1[out_col] = np.nan
-
-# -------------------------
-# 构建映射：先 (IBR, Drawee, Amount)；再兜底 (IBR, Amount)
-# -------------------------
-# 主映射： (IBR, Drawee, Amount) -> PGR
-sub2_main = (
-    df2.dropna(subset=[col2_ibr, col2_drawee, col2_pgr])
-       .groupby([col2_ibr, col2_drawee, "_amt_r"])[col2_pgr]
-       .first()
-       .reset_index()
-)
-
-main_dict = {
-    (row[col2_ibr], row[col2_drawee], row["_amt_r"]): row[col2_pgr]
-    for _, row in sub2_main.iterrows()
-}
-
-# 兜底映射： (IBR, Amount) -> PGR
-sub2_fallback = (
-    df2.dropna(subset=[col2_ibr, col2_pgr])
-       .groupby([col2_ibr, "_amt_r"])[col2_pgr]
-       .first()
-       .reset_index()
-)
-
-fallback_dict = {
-    (row[col2_ibr], row["_amt_r"]): row[col2_pgr]
-    for _, row in sub2_fallback.iterrows()
-}
-
-# -------------------------
-# 逐行赋值（只给还未赋值的行）
-# -------------------------
-mask_unassigned = df1[out_col].isna()
-idxs = df1.index[mask_unassigned].tolist()
-
-for idx in idxs:
-    ibr = df1.at[idx, col1_ibr]
-    drawee_val = df1.at[idx, col1_drawee]
-    amt_r = df1.at[idx, "_amt_r"]
-
-    key_main = (ibr, drawee_val, amt_r)
-    if key_main in main_dict:
-        df1.at[idx, out_col] = main_dict[key_main]
-    else:
-        key_fallback = (ibr, amt_r)
-        if key_fallback in fallback_dict:
-            df1.at[idx, out_col] = fallback_dict[key_fallback]
-
-# -------------------------
-# 清理临时列 + 输出
-# -------------------------
-df1 = df1.drop(columns=["_amt", "_amt_r"], errors="ignore")
-Output = df1
+# 4. 写出结果到 Alteryx 输出端口 1
+Alteryx.write(df1, 1)
