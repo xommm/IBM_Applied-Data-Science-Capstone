@@ -9,200 +9,146 @@ from decimal import Decimal, ROUND_HALF_UP
 # 0. 排查配置项
 # ==========================================
 TARGET_KEYWORD = "联合利华"
-ENABLE_DEBUG = True
 
 # ==========================================
-# 1. 清洗与转换函数定义
+# 1. 清洗与转换函数定义（带详细日志）
 # ==========================================
-def normalize_name_strict(value):
-    if pd.isna(value): return None
+def normalize_name_strict(value, show_steps=False):
+    if pd.isna(value):
+        if show_steps: print(f"  [Strict] 输入为 NaN → None")
+        return None
+    
     s = str(value).replace("\x00", "").replace("\ufeff", "")
+    if show_steps: print(f"  [Strict-1] 移除控制字符: '{value}' → '{s}'")
+    
     text = unicodedata.normalize("NFKC", s).strip()
-    if not text: return None
+    if show_steps: print(f"  [Strict-2] Unicode规范化+strip: '{s}' → '{text}'")
+    
+    if not text:
+        if show_steps: print(f"  [Strict] 结果为空 → None")
+        return None
+    
     text = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", text)
+    if show_steps: print(f"  [Strict-3] 移除隐形空格: → '{text}'")
+    
     text = re.sub(r"\s+", "", text).lower()
+    if show_steps: print(f"  [Strict-4] 去空格+小写: → '{text}'")
+    
     text = text.replace("（", "(").replace("）", ")")
+    if show_steps: print(f"  [Strict-5] 中文括号→英文括号: → '{text}'")
+    
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\(\)\-\,\.\u00b7]", "", text)
-    return text if text else None
+    if show_steps: print(f"  [Strict-6] 清理特殊字符(仅保留中英数+括号): → '{text}'")
+    
+    result = text if text else None
+    if show_steps: print(f"  [Strict] 最终结果: {result}\n")
+    return result
 
-def normalize_name_fuzzy(value):
-    if pd.isna(value): return None
+def normalize_name_fuzzy(value, show_steps=False):
+    if pd.isna(value):
+        if show_steps: print(f"  [Fuzzy] 输入为 NaN → None")
+        return None
+    
     s = str(value).replace("\x00", "").replace("\ufeff", "")
+    if show_steps: print(f"  [Fuzzy-1] 移除控制字符: '{value}' → '{s}'")
+    
     text = unicodedata.normalize("NFKC", s).strip().lower()
-    if not text: return None
+    if show_steps: print(f"  [Fuzzy-2] Unicode规范化+strip+小写: → '{text}'")
+    
+    if not text:
+        if show_steps: print(f"  [Fuzzy] 结果为空 → None")
+        return None
+    
     text = re.sub(r"[^\w\u4e00-\u9fff]", "", text)
+    if show_steps: print(f"  [Fuzzy-3] 清理非中英数字: → '{text}'")
+    
     suffixes = ["有限责任公司", "股份有限公司", "有限公司", "责任公司", "分公司", "公司", "中国", "上海分行", "分行"]
+    original_text = text
     for sfx in suffixes:
-        text = text.replace(sfx, "")
-    return text if text else None
+        if sfx in text:
+            text = text.replace(sfx, "")
+            if show_steps: print(f"  [Fuzzy-4] 移除后缀 '{sfx}': → '{text}'")
+    
+    if original_text == text and show_steps:
+        print(f"  [Fuzzy-4] 无匹配的后缀需移除")
+    
+    result = text if text else None
+    if show_steps: print(f"  [Fuzzy] 最终结果: {result}\n")
+    return result
 
-def normalize_name_aggressive(value):
-    if pd.isna(value): return None
+def normalize_name_aggressive(value, show_steps=False):
+    if pd.isna(value):
+        if show_steps: print(f"  [Aggressive] 输入为 NaN → None")
+        return None
+    
     s = str(value).replace("\x00", "").replace("\ufeff", "")
+    if show_steps: print(f"  [Aggressive-1] 移除控制字符: '{value}' → '{s}'")
+    
     text = unicodedata.normalize("NFKC", s).strip().lower()
+    if show_steps: print(f"  [Aggressive-2] Unicode规范化+strip+小写: → '{text}'")
+    
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", text)
-    return text if text else None
+    if show_steps: print(f"  [Aggressive-3] 只保留中英数字(去所有标点): → '{text}'")
+    
+    result = text if text else None
+    if show_steps: print(f"  [Aggressive] 最终结果: {result}\n")
+    return result
 
-def to_cents(value):
-    if pd.isna(value): return None
-    if isinstance(value, (float, np.floating)):
-        if np.isnan(value) or np.isinf(value): return None
-        num_str = f"{value:.2f}"
-    elif isinstance(value, (int, np.integer)):
-        num_str = str(value)
-    else:
-        s = unicodedata.normalize("NFKC", str(value)).strip()
-        if not s: return None
-        s = s.replace("\x00", "").replace("\ufeff", "").replace(",", "")
-        s = s.replace("￥", "").replace("$", "").replace("¥", "").replace("CNY", "")
-        s = s.replace("．", ".").replace("。", ".")
-        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1]
-        m = re.search(r"[-]?\d+(\.\d+)?([eE][+-]?\d+)?", s)
-        if not m: return None
-        num_str = m.group(0)
-    try:
-        amt = Decimal(num_str).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return int(amt * 100)
-    except Exception:
+def to_cents(value, show_steps=False):
+    if pd.isna(value):
+        if show_steps: print(f"  [金额] 输入为 NaN → None")
         return None
 
-# ==========================================
-# 2. 逐步规范化跟踪函数（用于DEBUG）
-# ==========================================
-def trace_normalize_fuzzy(value):
-    """逐步展示 fuzzy 规范化的全过程"""
-    steps = []
-    
-    if pd.isna(value):
-        return None, [("输入", "NaN/None")]
-    
-    original = str(value)
-    steps.append(("0. 原始输入", original))
-    
-    # 步骤1：移除隐藏字符
-    s = original.replace("\x00", "").replace("\ufeff", "")
-    steps.append(("1. 移除隐藏字符", s))
-    
-    # 步骤2：Unicode标准化
-    text = unicodedata.normalize("NFKC", s).strip().lower()
-    steps.append(("2. Unicode标准化+小写", text))
-    
-    # 步骤3：移除非中英数字符
-    text_before_regex = text
-    text = re.sub(r"[^\w\u4e00-\u9fff]", "", text)
-    steps.append((f"3. 移除非中英数 (regex替换)", f"{text_before_regex} → {text}"))
-    
-    # 步骤4：逐个删除后缀
-    suffixes = ["有限责任公司", "股份有限公司", "有限公司", "责任公司", "分公司", "公司", "中国", "上海分行", "分行"]
-    for sfx in suffixes:
-        text_before = text
-        text = text.replace(sfx, "")
-        if text != text_before:
-            steps.append((f"4. 删除后缀'{sfx}'", f"{text_before} → {text}"))
-    
-    # 步骤5：返回判断
-    result = text if text else None
-    if result is None:
-        steps.append(("5. 最终返回", f"None (因为处理后为空字符串)"))
-    else:
-        steps.append(("5. 最终返回", result))
-    
-    return result, steps
+    if show_steps: print(f"  [金额-1] 原始输入: {value} (类型: {type(value).__name__})")
 
-def trace_normalize_strict(value):
-    """逐步展示 strict 规范化的全过程"""
-    steps = []
-    
-    if pd.isna(value):
-        return None, [("输入", "NaN/None")]
-    
-    original = str(value)
-    steps.append(("0. 原始输入", original))
-    
-    s = original.replace("\x00", "").replace("\ufeff", "")
-    steps.append(("1. 移除隐藏字符", s))
-    
-    text = unicodedata.normalize("NFKC", s).strip()
-    steps.append(("2. Unicode标准化+strip", text))
-    
-    text = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", text)
-    steps.append(("3. 移除零宽字符", text))
-    
-    text = re.sub(r"\s+", "", text).lower()
-    steps.append(("4. 移除空格+小写", text))
-    
-    text = text.replace("（", "(").replace("）", ")")
-    steps.append(("5. 替换中文括号→英文括号", text))
-    
-    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\(\)\-\,\.\u00b7]", "", text)
-    steps.append(("6. 保留允许的字符", text))
-    
-    result = text if text else None
-    steps.append(("7. 最终返回", result))
-    
-    return result, steps
-
-def trace_to_cents(value):
-    """逐步展示金额转换的全过程"""
-    steps = []
-    
-    original = value
-    steps.append(("0. 原始输入", f"{original} (类型: {type(original).__name__})"))
-    
-    if pd.isna(value):
-        steps.append(("判定", "NaN/None → 返回 None"))
-        return None, steps
-    
     if isinstance(value, (float, np.floating)):
         if np.isnan(value) or np.isinf(value):
-            steps.append(("判定", "NaN/Inf → 返回 None"))
-            return None, steps
+            if show_steps: print(f"  [金额] NaN 或 Inf → None")
+            return None
         num_str = f"{value:.2f}"
-        steps.append(("转换", f"float转2位小数字符串: {num_str}"))
-        
+        if show_steps: print(f"  [金额-2] Float格式化为2位: {num_str}")
     elif isinstance(value, (int, np.integer)):
         num_str = str(value)
-        steps.append(("转换", f"int转字符串: {num_str}"))
-        
+        if show_steps: print(f"  [金额-2] Integer转字符串: {num_str}")
     else:
         s = unicodedata.normalize("NFKC", str(value)).strip()
-        steps.append(("1. Unicode标准化", s))
+        if show_steps: print(f"  [金额-2a] 字符串Unicode规范化: '{value}' → '{s}'")
         
         if not s:
-            steps.append(("判定", "空字符串 → 返回 None"))
-            return None, steps
-        
+            if show_steps: print(f"  [金额] 结果为空 → None")
+            return None
+
         s = s.replace("\x00", "").replace("\ufeff", "").replace(",", "")
-        steps.append(("2. 移除隐藏字符和逗号", s))
+        if show_steps: print(f"  [金额-2b] 移除控制字符和逗号: → '{s}'")
         
         s = s.replace("￥", "").replace("$", "").replace("¥", "").replace("CNY", "")
-        steps.append(("3. 移除货币符号", s))
+        if show_steps: print(f"  [金额-2c] 移除货币符号: → '{s}'")
         
         s = s.replace("．", ".").replace("。", ".")
-        steps.append(("4. 替换特殊小数点", s))
-        
+        if show_steps: print(f"  [金额-2d] 统一小数点: → '{s}'")
+
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1]
-            steps.append(("5. 括号→负号", s))
-        
+            if show_steps: print(f"  [金额-2e] 括号表负数转换: → '{s}'")
+
         m = re.search(r"[-]?\d+(\.\d+)?([eE][+-]?\d+)?", s)
         if not m:
-            steps.append(("判定", "未找到有效数字 → 返回 None"))
-            return None, steps
+            if show_steps: print(f"  [金额] 无法提取数字 → None")
+            return None
         num_str = m.group(0)
-        steps.append(("6. 提取数字", num_str))
-    
+        if show_steps: print(f"  [金额-2f] 正则提取数字: → '{num_str}'")
+
     try:
         amt = Decimal(num_str).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         cents = int(amt * 100)
-        steps.append(("7. Decimal转换", f"{num_str} → {amt} 元 → {cents} 分"))
-        return cents, steps
+        if show_steps: print(f"  [金额-3] Decimal转分: {amt} 元 → {cents} 分")
+        return cents
     except Exception as e:
-        steps.append(("错误", f"Decimal转换失败: {str(e)}"))
-        return None, steps
+        if show_steps: print(f"  [金额] Decimal转换异常: {e} → None")
+        return None
 
 # ==========================================
-# 3. 读取数据
+# 2. 读取数据并筛选目标关键词
 # ==========================================
 df_prop_raw = Alteryx.read("#1")
 df_pay_raw = Alteryx.read("#2")
@@ -210,185 +156,235 @@ df_pay_raw = Alteryx.read("#2")
 df_prop_raw.columns = [str(c).strip() for c in df_prop_raw.columns]
 df_pay_raw.columns = [str(c).strip() for c in df_pay_raw.columns]
 
-# 筛选包含目标关键词的记录
 mask_prop = df_prop_raw["Buyer Name (Local)"].astype(str).str.contains(TARGET_KEYWORD, case=False, na=False)
 mask_pay = df_pay_raw["Client_Name"].astype(str).str.contains(TARGET_KEYWORD, case=False, na=False)
 
 df_prop = df_prop_raw[mask_prop].copy()
 df_pay = df_pay_raw[mask_pay].copy()
 
+diag_logs = []
+
 print(f"\n{'='*80}")
 print(f"诊断开始：目标关键词 '{TARGET_KEYWORD}'")
-print(f"{'='*80}")
-print(f"Proposal 检索结果: {len(df_prop)} 条记录")
-print(f"Payment 检索结果: {len(df_pay)} 条记录\n")
-
-# ==========================================
-# 4. 详尽的规范化过程跟踪
-# ==========================================
-if not df_prop.empty:
-    print(f"\n【PROPOSAL 名称规范化追踪】\n")
-    for idx, row in df_prop.iterrows():
-        name = row["Buyer Name (Local)"]
-        print(f"Record #{idx+1}: {name}")
-        
-        # Strict 规范化
-        strict_result, strict_steps = trace_normalize_strict(name)
-        print(f"  Strict规范化过程:")
-        for step_name, step_value in strict_steps:
-            print(f"    {step_name:20s} → {step_value}")
-        
-        # Fuzzy 规范化
-        fuzzy_result, fuzzy_steps = trace_normalize_fuzzy(name)
-        print(f"  Fuzzy规范化过程:")
-        for step_name, step_value in fuzzy_steps:
-            print(f"    {step_name:25s} → {step_value}")
-        
-        # Aggressive 规范化
-        agg_result = normalize_name_aggressive(name)
-        print(f"  Aggressive规范化结果: {agg_result}")
-        
-        # 金额转换
-        amount = row["Proposal Total Amount"]
-        cents_result, cents_steps = trace_to_cents(amount)
-        print(f"  金额规范化过程:")
-        for step_name, step_value in cents_steps:
-            print(f"    {step_name:25s} → {step_value}")
-        print()
-
-if not df_pay.empty:
-    print(f"\n【PAYMENT 名称规范化追踪】\n")
-    for idx, row in df_pay.iterrows():
-        name = row["Client_Name"]
-        print(f"Record #{idx+1}: {name}")
-        
-        # Strict 规范化
-        strict_result, strict_steps = trace_normalize_strict(name)
-        print(f"  Strict规范化过程:")
-        for step_name, step_value in strict_steps:
-            print(f"    {step_name:20s} → {step_value}")
-        
-        # Fuzzy 规范化
-        fuzzy_result, fuzzy_steps = trace_normalize_fuzzy(name)
-        print(f"  Fuzzy规范化过程:")
-        for step_name, step_value in fuzzy_steps:
-            print(f"    {step_name:25s} → {step_value}")
-        
-        # Aggressive 规范化
-        agg_result = normalize_name_aggressive(name)
-        print(f"  Aggressive规范化结果: {agg_result}")
-        
-        # 金额转换
-        amount = row["Yesterday_Balance"]
-        cents_result, cents_steps = trace_to_cents(amount)
-        print(f"  金额规范化过程:")
-        for step_name, step_value in cents_steps:
-            print(f"    {step_name:25s} → {step_value}")
-        print()
-
-# ==========================================
-# 5. 生成对比总结表
-# ==========================================
-summary_data = []
-
-if not df_prop.empty:
-    for idx, row in df_prop.iterrows():
-        name = row["Buyer Name (Local)"]
-        summary_data.append({
-            "来源": "Proposal",
-            "记录号": idx+1,
-            "原始名称": name,
-            "Strict_Key": normalize_name_strict(name),
-            "Fuzzy_Key": normalize_name_fuzzy(name),
-            "Aggressive_Key": normalize_name_aggressive(name),
-            "原始金额": row["Proposal Total Amount"],
-            "转换后分值": to_cents(row["Proposal Total Amount"])
-        })
-
-if not df_pay.empty:
-    for idx, row in df_pay.iterrows():
-        name = row["Client_Name"]
-        summary_data.append({
-            "来源": "Payment",
-            "记录号": idx+1,
-            "原始名称": name,
-            "Strict_Key": normalize_name_strict(name),
-            "Fuzzy_Key": normalize_name_fuzzy(name),
-            "Aggressive_Key": normalize_name_aggressive(name),
-            "原始金额": row["Yesterday_Balance"],
-            "转换后分值": to_cents(row["Yesterday_Balance"])
-        })
-
-df_summary = pd.DataFrame(summary_data)
-
-print(f"\n【对比总结表】\n")
-print(df_summary.to_string(index=False))
-
-# ==========================================
-# 6. Key 匹配分析
-# ==========================================
-print(f"\n\n【KEY匹配分析】\n")
-
-prop_strict_keys = set(df_prop["Buyer Name (Local)"].apply(normalize_name_strict).dropna().unique())
-pay_strict_keys = set(df_pay["Client_Name"].apply(normalize_name_strict).dropna().unique())
-strict_overlap = prop_strict_keys.intersection(pay_strict_keys)
-
-prop_fuzzy_keys = set(df_prop["Buyer Name (Local)"].apply(normalize_name_fuzzy).dropna().unique())
-pay_fuzzy_keys = set(df_pay["Client_Name"].apply(normalize_name_fuzzy).dropna().unique())
-fuzzy_overlap = prop_fuzzy_keys.intersection(pay_fuzzy_keys)
-
-prop_agg_keys = set(df_prop["Buyer Name (Local)"].apply(normalize_name_aggressive).dropna().unique())
-pay_agg_keys = set(df_pay["Client_Name"].apply(normalize_name_aggressive).dropna().unique())
-agg_overlap = prop_agg_keys.intersection(pay_agg_keys)
-
-print(f"Strict Key:")
-print(f"  Proposal 的 Strict Key: {prop_strict_keys}")
-print(f"  Payment 的 Strict Key:  {pay_strict_keys}")
-print(f"  匹配结果: {'✓ 成功匹配' if strict_overlap else '✗ 不匹配'} {strict_overlap if strict_overlap else '(无交集)'}")
-
-print(f"\nFuzzy Key:")
-print(f"  Proposal 的 Fuzzy Key: {prop_fuzzy_keys}")
-print(f"  Payment 的 Fuzzy Key:  {pay_fuzzy_keys}")
-print(f"  匹配结果: {'✓ 成功匹配' if fuzzy_overlap else '✗ 不匹配'} {fuzzy_overlap if fuzzy_overlap else '(无交集)'}")
-
-print(f"\nAggressive Key:")
-print(f"  Proposal 的 Aggressive Key: {prop_agg_keys}")
-print(f"  Payment 的 Aggressive Key:  {pay_agg_keys}")
-print(f"  匹配结果: {'✓ 成功匹配' if agg_overlap else '✗ 不匹配'} {agg_overlap if agg_overlap else '(无交集)'}")
-
-# ==========================================
-# 7. 金额对齐分析
-# ==========================================
-print(f"\n\n【金额对齐分析】\n")
-
-prop_amounts = df_prop["Proposal Total Amount"].apply(to_cents).dropna()
-pay_amounts = df_pay["Yesterday_Balance"].apply(to_cents).dropna()
-
-print(f"Proposal 金额汇总:")
-for idx, (orig, cents) in enumerate(zip(df_prop["Proposal Total Amount"], df_prop["Proposal Total Amount"].apply(to_cents))):
-    if pd.notna(cents):
-        print(f"  记录 {idx+1}: {orig} → {cents} 分 ({cents/100.0:.2f} 元)")
-
-total_prop_cents = prop_amounts.sum()
-print(f"  【总计】: {total_prop_cents} 分 ({total_prop_cents/100.0:.2f} 元)")
-
-print(f"\nPayment 金额:")
-for idx, (orig, cents) in enumerate(zip(df_pay["Yesterday_Balance"], df_pay["Yesterday_Balance"].apply(to_cents))):
-    if pd.notna(cents):
-        print(f"  记录 {idx+1}: {orig} → {cents} 分 ({cents/100.0:.2f} 元)")
-
-print(f"\n金额匹配检查:")
-for idx, row in df_pay.iterrows():
-    pay_cents = to_cents(row["Yesterday_Balance"])
-    if pay_cents is not None:
-        diff = total_prop_cents - pay_cents
-        status = "✓ 完美匹配" if diff == 0 else f"✗ 差异 {diff} 分 ({diff/100.0:.2f} 元)"
-        print(f"  Payment 记录 {idx+1}: {pay_cents} 分 vs Proposal 汇总 {total_prop_cents} 分 → {status}")
-
-# ==========================================
-# 8. 输出到 Alteryx
-# ==========================================
-Alteryx.write(df_summary, 1)
-print(f"\n{'='*80}")
-print("诊断完成！详尽信息已输出到 Alteryx 端口 #1")
 print(f"{'='*80}\n")
+
+# ==========================================
+# 排查 1: 原始数据检索
+# ==========================================
+print(f"[1] 数据检索")
+print(f"    Proposal 查到 {len(df_prop)} 条")
+print(f"    Payment 查到 {len(df_pay)} 条\n")
+
+if df_prop.empty or df_pay.empty:
+    print(f"❌ 无法继续诊断（数据不足）\n")
+else:
+    # ==========================================
+    # 排查 2: 名称规范化详细过程
+    # ==========================================
+    print(f"[2] 名称规范化过程详解\n")
+    
+    print("=" * 80)
+    print("Proposal 记录名称规范化:")
+    print("=" * 80)
+    df_prop["strict_key"] = df_prop["Buyer Name (Local)"].apply(
+        lambda x: normalize_name_strict(x, show_steps=False)
+    )
+    df_prop["fuzzy_key"] = df_prop["Buyer Name (Local)"].apply(
+        lambda x: normalize_name_fuzzy(x, show_steps=False)
+    )
+    df_prop["aggressive_key"] = df_prop["Buyer Name (Local)"].apply(
+        lambda x: normalize_name_aggressive(x, show_steps=False)
+    )
+    
+    for idx, row in df_prop.iterrows():
+        print(f"\n  记录 {idx+1}: {row['Buyer Name (Local)']}")
+        normalize_name_strict(row["Buyer Name (Local)"], show_steps=True)
+        normalize_name_fuzzy(row["Buyer Name (Local)"], show_steps=True)
+        normalize_name_aggressive(row["Buyer Name (Local)"], show_steps=True)
+
+    print("\n" + "=" * 80)
+    print("Payment 记录名称规范化:")
+    print("=" * 80)
+    df_pay["strict_key"] = df_pay["Client_Name"].apply(
+        lambda x: normalize_name_strict(x, show_steps=False)
+    )
+    df_pay["fuzzy_key"] = df_pay["Client_Name"].apply(
+        lambda x: normalize_name_fuzzy(x, show_steps=False)
+    )
+    df_pay["aggressive_key"] = df_pay["Client_Name"].apply(
+        lambda x: normalize_name_aggressive(x, show_steps=False)
+    )
+    
+    for idx, row in df_pay.iterrows():
+        print(f"\n  记录 {idx+1}: {row['Client_Name']}")
+        normalize_name_strict(row["Client_Name"], show_steps=True)
+        normalize_name_fuzzy(row["Client_Name"], show_steps=True)
+        normalize_name_aggressive(row["Client_Name"], show_steps=True)
+
+    # ==========================================
+    # 排查 3: 金额转换详细过程
+    # ==========================================
+    print("\n" + "=" * 80)
+    print("金额转换过程详解")
+    print("=" * 80)
+    
+    print("\nProposal 金额转换:")
+    df_prop["cents"] = df_prop["Proposal Total Amount"].apply(
+        lambda x: to_cents(x, show_steps=False)
+    )
+    
+    for idx, row in df_prop.iterrows():
+        print(f"\n  记录 {idx+1}:")
+        to_cents(row["Proposal Total Amount"], show_steps=True)
+
+    print("\nPayment 金额转换:")
+    df_pay["cents"] = df_pay["Yesterday_Balance"].apply(
+        lambda x: to_cents(x, show_steps=False)
+    )
+    
+    for idx, row in df_pay.iterrows():
+        print(f"\n  记录 {idx+1}:")
+        to_cents(row["Yesterday_Balance"], show_steps=True)
+
+    # ==========================================
+    # 排查 4: Key 匹配分析
+    # ==========================================
+    print("\n" + "=" * 80)
+    print("Key 匹配分析")
+    print("=" * 80)
+    
+    prop_strict = set(df_prop["strict_key"].dropna().unique())
+    pay_strict = set(df_pay["strict_key"].dropna().unique())
+    strict_overlap = prop_strict.intersection(pay_strict)
+    
+    prop_fuzzy = set(df_prop["fuzzy_key"].dropna().unique())
+    pay_fuzzy = set(df_pay["fuzzy_key"].dropna().unique())
+    fuzzy_overlap = prop_fuzzy.intersection(pay_fuzzy)
+    
+    prop_aggressive = set(df_prop["aggressive_key"].dropna().unique())
+    pay_aggressive = set(df_pay["aggressive_key"].dropna().unique())
+    aggressive_overlap = prop_aggressive.intersection(pay_aggressive)
+
+    print(f"\n[Strict Key]")
+    print(f"  Proposal: {prop_strict}")
+    print(f"  Payment:  {pay_strict}")
+    print(f"  匹配:     {strict_overlap if strict_overlap else '❌ 无匹配'}")
+
+    print(f"\n[Fuzzy Key]")
+    print(f"  Proposal: {prop_fuzzy}")
+    print(f"  Payment:  {pay_fuzzy}")
+    print(f"  匹配:     {fuzzy_overlap if fuzzy_overlap else '❌ 无匹配'}")
+
+    print(f"\n[Aggressive Key]")
+    print(f"  Proposal: {prop_aggressive}")
+    print(f"  Payment:  {pay_aggressive}")
+    print(f"  匹配:     {aggressive_overlap if aggressive_overlap else '❌ 无匹配'}")
+
+    # ==========================================
+    # 排查 5: 金额对齐分析
+    # ==========================================
+    print("\n" + "=" * 80)
+    print("金额对齐分析")
+    print("=" * 80)
+    
+    print(f"\nProposal 金额汇总（正数）:")
+    pos_prop_cents = df_prop[df_prop["cents"] > 0]["cents"].tolist()
+    total_prop_cents = sum(pos_prop_cents)
+    print(f"  单笔金额: {[c/100.0 for c in pos_prop_cents]}")
+    print(f"  汇总:    {total_prop_cents / 100.0:.2f} 元 ({total_prop_cents} 分)")
+
+    print(f"\nPayment 金额:")
+    for idx, row in df_pay.iterrows():
+        pay_cents = row["cents"]
+        pay_raw = row["Yesterday_Balance"]
+        print(f"  记录 {idx+1}: {pay_raw} → {pay_cents/100.0:.2f} 元 ({pay_cents} 分)")
+
+    # ==========================================
+    # 排查 6: 匹配结果清单
+    # ==========================================
+    print("\n" + "=" * 80)
+    print("匹配结果清单")
+    print("=" * 80)
+
+    match_results = []
+
+    # 尝试每种 Key 方式
+    for key_type, key_col in [("Strict", "strict_key"), ("Fuzzy", "fuzzy_key"), ("Aggressive", "aggressive_key")]:
+        print(f"\n【{key_type} Key 方式】")
+        
+        prop_by_key = {}
+        for idx, row in df_prop.iterrows():
+            key = row[key_col]
+            if pd.notna(key):
+                if key not in prop_by_key:
+                    prop_by_key[key] = []
+                prop_by_key[key].append(row)
+
+        found_match = False
+        for key, prop_rows in prop_by_key.items():
+            pay_rows = df_pay[df_pay[key_col] == key]
+            
+            if pay_rows.empty:
+                continue
+
+            prop_sum = sum(r["cents"] for r in prop_rows if r["cents"] > 0)
+            prop_ids = [r.get("proposal_key", idx) for idx, r in enumerate(prop_rows)]
+
+            for _, pay_row in pay_rows.iterrows():
+                pay_cents = pay_row["cents"]
+                pay_id = pay_row.get("payment_key", "?")
+
+                if pay_cents == prop_sum:
+                    print(f"  ✅ 成功: {len(prop_rows)} Proposal ({prop_ids}) = 1 Payment ({pay_id})")
+                    print(f"     金额: {prop_sum/100.0:.2f} 元 ✓")
+                    match_results.append({
+                        "Key方式": key_type,
+                        "匹配状态": "✅ 成功",
+                        "Payment_ID": pay_id,
+                        "Payment金额(元)": f"{pay_cents/100.0:.2f}",
+                        "Proposal_IDs": str(prop_ids),
+                        "Proposal汇总(元)": f"{prop_sum/100.0:.2f}",
+                        "记录数": f"{len(prop_rows)} + 1",
+                        "说明": "完全匹配"
+                    })
+                    found_match = True
+                else:
+                    diff = abs(pay_cents - prop_sum)
+                    print(f"  ❌ 失败: {len(prop_rows)} Proposal ({prop_ids}) ≠ 1 Payment ({pay_id})")
+                    print(f"     差异: {diff/100.0:.2f} 元 (Payment {pay_cents/100.0:.2f} vs Proposal {prop_sum/100.0:.2f})")
+                    match_results.append({
+                        "Key方式": key_type,
+                        "匹配状态": "❌ 失败",
+                        "Payment_ID": pay_id,
+                        "Payment金额(元)": f"{pay_cents/100.0:.2f}",
+                        "Proposal_IDs": str(prop_ids),
+                        "Proposal汇总(元)": f"{prop_sum/100.0:.2f}",
+                        "记录数": f"{len(prop_rows)} + 1",
+                        "说明": f"金额差异 {diff/100.0:.2f} 元"
+                    })
+
+        if not found_match:
+            print(f"  🔍 未找到匹配")
+
+print(f"\n{'='*80}\n")
+
+# ==========================================
+# 3. 输出到 Alteryx
+# ==========================================
+df_diag = pd.DataFrame(diag_logs)
+df_match = pd.DataFrame(match_results)
+
+# 第1个端口：诊断日志
+Alteryx.write(df_diag if not df_diag.empty else pd.DataFrame({"说明": ["暂无诊断日志"]}), 1)
+
+# 第2个端口：匹配清单
+Alteryx.write(df_match if not df_match.empty else pd.DataFrame({"说明": ["暂无匹配结果"]}), 2)
+
+# 第3个端口：数据明细
+df_prop_detail = df_prop[["Buyer Name (Local)", "strict_key", "fuzzy_key", "aggressive_key", "Proposal Total Amount", "cents"]].copy()
+df_prop_detail["数据来源"] = "Proposal"
+df_pay_detail = df_pay[["Client_Name", "strict_key", "fuzzy_key", "aggressive_key", "Yesterday_Balance", "cents"]].copy()
+df_pay_detail["数据来源"] = "Payment"
+
+df_all_detail = pd.concat([df_prop_detail, df_pay_detail], ignore_index=True)
+Alteryx.write(df_all_detail, 3)
