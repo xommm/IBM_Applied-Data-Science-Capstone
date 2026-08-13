@@ -1,0 +1,118 @@
+import pandas as pd
+import numpy as np
+
+# =========================
+# 输入
+# =========================
+df1 = Input1.copy()  # 完整信息表
+df2 = Input2.copy()  # Paymentgroup 表
+
+# =========================
+# 字段名（按你的描述）
+# =========================
+col1_ibr = "Internal Buyer Reference"
+col1_amt = "Proposal Total Amount"
+col1_drawee = "Buyer Name (Local)"  # 你指定：Input1 中的 Drawee 改名为 Buyer Name (Local)
+
+col2_pgr = "Payment Group Reference"
+col2_amt = "Payment Net Amount"
+col2_drawee = "Drawee (Local)"      # 默认 Input2 仍叫这个（如不一致请改）
+col2_ibr = "Internal Buyer Reference"
+
+out_col = "Payment Group Reference"
+
+# =========================
+# 金额标准化（避免浮点比较问题）
+# =========================
+df1["_amt"] = pd.to_numeric(df1[col1_amt], errors="coerce")
+df2["_amt"] = pd.to_numeric(df2[col2_amt], errors="coerce")
+
+ROUND_DECIMALS = 2
+df1["_amt_r"] = df1["_amt"].round(ROUND_DECIMALS)
+df2["_amt_r"] = df2["_amt"].round(ROUND_DECIMALS)
+
+# =========================
+# 初始化输出
+# =========================
+df1[out_col] = np.nan
+
+# 用来定位行
+df1["_df1_idx"] = df1.index
+df2 = df2.reset_index(drop=True)
+df2["_df2_idx"] = df2.index
+
+# =========================
+# 逐 IBR 处理
+# =========================
+ibr_values = df1[col1_ibr].dropna().unique()
+
+for ibr in ibr_values:
+    sub1 = df1[df1[col1_ibr] == ibr].copy()
+    sub2 = df2[df2[col2_ibr] == ibr].copy()
+
+    if sub1.empty or sub2.empty:
+        continue
+
+    # 情况：Input2 在此 IBR 只有一个 Payment Group Reference -> 直接挂所有
+    pgr_nunique = sub2[col2_pgr].nunique(dropna=True)
+    if pgr_nunique == 1:
+        pgr_val = sub2[col2_pgr].dropna().iloc[0]
+        df1.loc[sub1["_df1_idx"], out_col] = pgr_val
+        continue
+
+    # 否则：用 (IBR, Drawee, Amount) 先匹配，再用 (IBR, Amount) 兜底
+    # 因为你保证：同一 IBR 下同金额不会对应多个 Payment Group Reference，
+    # 所以匹配到金额时 PGR 应该是唯一的。
+
+    # 1) 主映射： (IBR, Drawee, Amount) -> PGR
+    sub2_map_main = (
+        sub2.dropna(subset=[col2_pgr, col2_drawee])
+           .groupby([col2_ibr, col2_drawee, "_amt_r"])[col2_pgr]
+           .first()
+           .reset_index()
+    )
+
+    # 构建字典映射以加速
+    main_dict = {}
+    for _, r in sub2_map_main.iterrows():
+        key = (r[col2_ibr], r[col2_drawee], r["_amt_r"])
+        main_dict[key] = r[col2_pgr]
+
+    # 2) 兜底映射： (IBR, Amount) -> PGR
+    sub2_map_fallback = (
+        sub2.dropna(subset=[col2_pgr])
+           .groupby([col2_ibr, "_amt_r"])[col2_pgr]
+           .first()
+           .reset_index()
+    )
+
+    fallback_dict = {}
+    for _, r in sub2_map_fallback.iterrows():
+        key = (r[col2_ibr], r["_amt_r"])
+        fallback_dict[key] = r[col2_pgr]
+
+    # 只处理尚未赋值的行
+    idx_unassigned = sub1[sub1[out_col].isna()]["_df1_idx"].tolist()
+
+    for idx in idx_unassigned:
+        row = df1.loc[idx]
+        drawee_val = row[col1_drawee]
+        amt_r = row["_amt_r"]
+
+        key_main = (ibr, drawee_val, amt_r)
+        if key_main in main_dict:
+            df1.at[idx, out_col] = main_dict[key_main]
+        else:
+            key_fallback = (ibr, amt_r)
+            if key_fallback in fallback_dict:
+                df1.at[idx, out_col] = fallback_dict[key_fallback]
+
+# =========================
+# 清理临时列
+# =========================
+df1 = df1.drop(columns=[c for c in ["_amt", "_amt_r", "_df1_idx"] if c in df1.columns], errors="ignore")
+
+# =========================
+# 输出
+# =========================
+Output = df1
