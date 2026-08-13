@@ -13,6 +13,7 @@ import numpy as np
 MAX_PROPOSALS_PER_MATCH = 50
 MAX_PAYMENTS_PER_MATCH = 50
 
+# 是否开启诊断信息列（True 保留调试列，False 自动清理）
 ENABLE_DEBUG_DIAGNOSTICS = True
 
 # 只做 strict key 匹配（不做 fuzzy_key / aggressive_key）
@@ -24,6 +25,7 @@ ENABLE_AGGRESSIVE_KEY_MATCH = False
 # 1. 辅助函数（客户名 strict key + 金额转分）
 # ==========================================
 def normalize_name_strict(value):
+    """规格化客户名称，去除零宽字符、统一半角括号、全小写并移除非关键字字符。"""
     if pd.isna(value):
         return None
     s = str(value).replace("\x00", "").replace("\ufeff", "")
@@ -39,6 +41,7 @@ def normalize_name_strict(value):
 
 
 def to_cents(value):
+    """将各种格式的金额转换为整数“分”，规避浮点数精度误差。"""
     if pd.isna(value):
         return None
 
@@ -73,17 +76,19 @@ def to_cents(value):
 
 
 def format_money_from_cents(cents):
+    """将整数“分”格式化回保留两位小数的字符串金额。"""
     if cents is None:
         return None
     return f"{Decimal(int(cents)) / Decimal(100):.2f}"
 
 
 def format_unique_field(record_list, field_name):
+    """提取多条记录中的唯一非空字段值，以逗号分隔拼接。"""
     valid_values = []
     seen = set()
     for record in record_list:
         value = record.get(field_name)
-        if pd.isna(value):
+        if pd.isna(value) or value is None:
             continue
         string_value = str(value).strip()
         if not string_value or string_value in seen:
@@ -97,7 +102,7 @@ def format_unique_field(record_list, field_name):
 # 2. 子集搜索：支持 min_items（整数分精确匹配）
 # ==========================================
 def find_best_subset(records, target, max_items, min_items=1):
-    """在 records 中寻找金额合计等于 target 的组合（整数分精确匹配）。"""
+    """在 records 中寻找金额合计等于 target 的组合（整数分精确匹配，剪枝 DFS）。"""
 
     if target < 0:
         return None
@@ -105,7 +110,7 @@ def find_best_subset(records, target, max_items, min_items=1):
     positive_records = [r for r in records if r["amount"] > 0]
     zero_records = [r for r in records if r["amount"] == 0]
 
-    # target==0：
+    # target == 0 特殊处理：
     if target == 0:
         if min_items <= 1:
             return [zero_records[0]] if zero_records else None
@@ -195,15 +200,16 @@ if "proposal_key" not in df_proposal.columns or df_proposal["proposal_key"].isna
         df_proposal["proposal_key"] = df_proposal["Record"]
     else:
         df_proposal["proposal_key"] = range(1, len(df_proposal) + 1)
-df_proposal["proposal_key"] = df_proposal["proposal_key"].fillna(df_proposal.index.to_series() + 1)
+df_proposal["proposal_key"] = df_proposal["proposal_key"].fillna(pd.Series(df_proposal.index + 1, index=df_proposal.index))
 
 if "payment_key" not in df_payment.columns or df_payment["payment_key"].isna().all():
     if "Record" in df_payment.columns:
         df_payment["payment_key"] = df_payment["Record"]
     else:
         df_payment["payment_key"] = range(1, len(df_payment) + 1)
-df_payment["payment_key"] = df_payment["payment_key"].fillna(df_payment.index.to_series() + 1)
+df_payment["payment_key"] = df_payment["payment_key"].fillna(pd.Series(df_payment.index + 1, index=df_payment.index))
 
+# 必填字段校验
 required_proposal_columns = ["proposal_key", "Buyer Name (Local)", "Proposal Total Amount"]
 required_payment_columns = ["payment_key", "Client_Name", "Yesterday_Balance"]
 
@@ -482,7 +488,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
 
 
 # ==========================================
-# 7. 依次执行：只跑 strict
+# 7. 执行匹配
 # ==========================================
 run_matching_engine(df_proposal_clean, df_payment_clean, "_client_match_key")
 
@@ -521,7 +527,7 @@ for column_name in result_columns:
 # 未匹配 payments
 df_unmatched_payments = df_payment[~df_payment["_payment_row_id"].isin(matched_payment_row_ids)].copy()
 
-# 丢掉内部字段
+# 丢掉内部中间字段
 proposal_internal_columns = [
     "_proposal_row_id",
     "_client_match_key",
@@ -534,13 +540,12 @@ payment_internal_columns = [
     "_amount_cents",
 ]
 
-# aggressive/fuzzy 不存在时也不会报错
 for c in [c for c in proposal_internal_columns if c in df_proposal.columns]:
     df_proposal = df_proposal.drop(columns=[c])
 for c in [c for c in payment_internal_columns if c in df_unmatched_payments.columns]:
     df_unmatched_payments = df_unmatched_payments.drop(columns=[c])
 
-# 诊断列清理：你这里 ENABLE_DEBUG_DIAGNOSTICS=True 时保留诊断列；否则删掉
+# 诊断列清理：不需要诊断调试信息时将顶部 ENABLE_DEBUG_DIAGNOSTICS 设为 False 即可
 if not ENABLE_DEBUG_DIAGNOSTICS:
     diag_cols = [
         "_debug_proposal_raw_amount",
@@ -557,6 +562,6 @@ if not ENABLE_DEBUG_DIAGNOSTICS:
         if col in df_unmatched_payments.columns:
             df_unmatched_payments = df_unmatched_payments.drop(columns=[col])
 
-
+# 输出回 Alteryx 端口
 Alteryx.write(df_proposal, 1)
 Alteryx.write(df_unmatched_payments, 2)
