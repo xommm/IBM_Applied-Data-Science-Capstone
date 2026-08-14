@@ -21,7 +21,7 @@ ENABLE_DEBUG_DIAGNOSTICS = True
 
 
 # ==========================================
-# 1. 辅助函数（客户名 strict key + 金额转分）
+# 1. 辅助函数（客户名、金额、日期解析）
 # ==========================================
 def normalize_name_strict(value):
     """深度规格化客户名称：去除所有 Unicode 隐藏字符、全半角空格、统一半角括号并小写。"""
@@ -75,6 +75,30 @@ def to_cents(value):
         return None
 
 
+def parse_processing_date(value):
+    """
+    解析 Processing_Date：
+    - 返回标准日期字符串（用于回填显示）
+    - 返回排序元组 (priority, date_str)：
+      - 有具体日期：(0, "2026-08-07") -> 优先级最高，按日期先后升序排序
+      - 为空/Null/当天：(1, "9999-99-99") -> 优先级最低，排在最后处理
+    """
+    if pd.isna(value):
+        return None, (1, "9999-99-99")
+
+    s = str(value).strip()
+    if not s or s.lower() in ("null", "[null]", "none", "nan", "nat", ""):
+        return None, (1, "9999-99-99")
+
+    m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        year, month, day = m.groups()
+        norm_date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        return norm_date, (0, norm_date)
+
+    return s, (0, s)
+
+
 def format_money_from_cents(cents):
     """将整数“分”格式化回保留两位小数的字符串金额。"""
     if cents is None:
@@ -99,7 +123,7 @@ def format_unique_field(record_list, field_name):
 
 
 # ==========================================
-# 2. 子集搜索：支持 min_items 与 ±1分钱 尾差容错
+# 2. 子集搜索：保持优先级顺序 + 动态剪枝
 # ==========================================
 def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANCE_CENTS):
     """在 records 中寻找金额合计约等于 target 的组合（支持 ±tolerance 分尾差容错）。"""
@@ -118,8 +142,7 @@ def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANC
             return zero_records[:min_items]
         return None
 
-    sorted_records = sorted(positive_records, key=lambda r: (-r["amount"], r["row_id"]))
-    record_count = len(sorted_records)
+    record_count = len(positive_records)
     if record_count == 0:
         return None
 
@@ -149,20 +172,25 @@ def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANC
             if remaining < -tolerance:
                 return
 
-            max_possible = sum(sorted_records[i]["amount"] for i in range(start_index, start_index + slots_left))
-            min_possible = sum(sorted_records[i]["amount"] for i in range(record_count - slots_left, record_count))
+            # 动态上下界剪枝
+            rem_amounts = [positive_records[i]["amount"] for i in range(start_index, record_count)]
+            rem_amounts.sort()
+            min_possible = sum(rem_amounts[:slots_left])
+            max_possible = sum(rem_amounts[-slots_left:])
 
             if remaining > max_possible + tolerance or remaining < min_possible - tolerance:
                 return
 
-            last_amount = None
+            last_key = None
             for index in range(start_index, record_count - slots_left + 1):
-                record = sorted_records[index]
+                record = positive_records[index]
                 amount = record["amount"]
 
-                if last_amount is not None and amount == last_amount:
+                # 相同优先级和金额的分支去重
+                record_key = (record.get("date_sort_key"), amount)
+                if last_key is not None and record_key == last_key:
                     continue
-                last_amount = amount
+                last_key = record_key
 
                 if amount > remaining + tolerance:
                     continue
@@ -220,12 +248,12 @@ if missing_proposal_columns:
 if missing_payment_columns:
     raise ValueError("Payment 输入缺少字段：" + ", ".join(missing_payment_columns))
 
-# 可选字段补齐
+# 可选字段补齐（包括 Processing_Date）
 def ensure_optional_column(df, col):
     if col not in df.columns:
         df[col] = None
 
-for col in ["Debit Account", "Debtor_Agent_Name", "Debtor Agent Party ID"]:
+for col in ["Debit Account", "Debtor_Agent_Name", "Debtor Agent Party ID", "Processing_Date"]:
     ensure_optional_column(df_payment, col)
 
 
@@ -244,6 +272,11 @@ df_payment["_client_match_key"] = df_payment["Client_Name"].apply(normalize_name
 df_proposal["_amount_cents"] = df_proposal["Proposal Total Amount"].apply(to_cents)
 df_payment["_amount_cents"] = df_payment["Yesterday_Balance"].apply(to_cents)
 
+# 解析并提取 Payment 日期与日期排序权重
+payment_date_parsed = df_payment["Processing_Date"].apply(parse_processing_date)
+df_payment["_clean_processing_date"] = [p[0] for p in payment_date_parsed]
+df_payment["_date_sort_key"] = [p[1] for p in payment_date_parsed]
+
 if ENABLE_DEBUG_DIAGNOSTICS:
     df_proposal["_debug_proposal_raw_amount"] = df_proposal["_amount_cents"].apply(
         lambda c: round(c / 100.0, 2) if pd.notna(c) else None
@@ -255,6 +288,7 @@ if ENABLE_DEBUG_DIAGNOSTICS:
     df_payment["_debug_payment_raw_name"] = df_payment["Client_Name"]
     df_proposal["_debug_proposal_client_key"] = df_proposal["_client_match_key"]
     df_payment["_debug_payment_client_key"] = df_payment["_client_match_key"]
+    df_payment["_debug_payment_date"] = df_payment["_clean_processing_date"]
 
 df_proposal_clean = df_proposal.dropna(subset=["_amount_cents"]).copy()
 df_payment_clean = df_payment.dropna(subset=["_amount_cents"]).copy()
@@ -287,6 +321,7 @@ def save_match(proposal_records, payment_records):
 
     payment_ids_string = ", ".join(str(p["id"]) for p in payment_records)
     payment_amounts_string = ", ".join(format_money_from_cents(p["amount"]) for p in payment_records)
+    payment_dates_string = format_unique_field(payment_records, "Processing_Date")
     proposal_ids_string = ", ".join(str(pr["id"]) for pr in proposal_records)
 
     debit_account_string = format_unique_field(payment_records, "Debit Account")
@@ -296,6 +331,7 @@ def save_match(proposal_records, payment_records):
     result = {
         "Matched_Payment_IDs": payment_ids_string,
         "Matched_Payment_Amounts": payment_amounts_string,
+        "Matched_Processing_Dates": payment_dates_string,
         "Matched_Debit_Account": debit_account_string,
         "Matched_Debtor_Agent_Name": debtor_agent_name_string,
         "Matched_Debtor_Agent_Party_ID": debtor_agent_party_id_string,
@@ -314,7 +350,7 @@ def save_match(proposal_records, payment_records):
 
 
 # ==========================================
-# 6. 核心匹配引擎（支持 ±1分钱 尾差容错）
+# 6. 核心匹配引擎（支持早日期优先 & ±1分钱 尾差容错）
 # ==========================================
 def run_matching_engine(prop_df, pay_df, key_column):
     for client_key, proposal_group in prop_df.groupby(key_column, sort=False):
@@ -346,16 +382,20 @@ def run_matching_engine(prop_df, pay_df, key_column):
                     "row_id": int(row["_payment_row_id"]),
                     "id": row["payment_key"],
                     "amount": int(row["_amount_cents"]),
+                    "Processing_Date": row["_clean_processing_date"],
+                    "date_sort_key": row["_date_sort_key"],
                     "Debit Account": row["Debit Account"],
                     "Debtor_Agent_Name": row["Debtor_Agent_Name"],
                     "Debtor Agent Party ID": row["Debtor Agent Party ID"],
                 }
             )
 
+        # 提案优先大额在前
         available_proposals.sort(key=lambda r: (-r["amount"], r["row_id"]))
-        available_payments.sort(key=lambda r: (-r["amount"], r["row_id"]))
+        # 支付优先早日期在前，Null（当天）在最后；同日期按大额在前
+        available_payments.sort(key=lambda r: (r["date_sort_key"], -r["amount"], r["row_id"]))
 
-        # 阶段 0：全额直通车（支持 ±1分钱 容错）
+        # 阶段 0：全额直通车（优先匹配最早日期的 Payment）
         total_proposal_sum = sum(p["amount"] for p in available_proposals)
         for payment in list(available_payments):
             if abs(payment["amount"] - total_proposal_sum) <= TOLERANCE_CENTS and len(available_proposals) >= 1:
@@ -367,7 +407,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 1：一笔 Payment 匹配多笔 Proposal（>=2，支持 ±1分钱 容错）
+        # 阶段 1：一笔 Payment 匹配多笔 Proposal（优先为早日期的 Payment 寻找组合）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -394,7 +434,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 2：同金额一对一（支持 ±1分钱 容错）
+        # 阶段 2：同金额一对一（优先匹配早日期的 Payment）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -419,7 +459,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 3：一笔 Proposal 匹配多笔 Payment（>=2，支持 ±1分钱 容错）
+        # 阶段 3：一笔 Proposal 匹配多笔 Payment（优先挑选早日期的 Payment 凑数）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -446,7 +486,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 4：多 Proposal 对多 Payment（双方>=2，支持 ±1分钱 容错）
+        # 阶段 4：多 Proposal 对多 Payment（双方>=2，优先使用早日期的 Payment）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -505,6 +545,7 @@ def get_match_value(proposal_row_id, column_name):
 result_columns = [
     "Matched_Payment_IDs",
     "Matched_Payment_Amounts",
+    "Matched_Processing_Dates",
     "Matched_Debit_Account",
     "Matched_Debtor_Agent_Name",
     "Matched_Debtor_Agent_Party_ID",
@@ -525,7 +566,13 @@ df_unmatched_payments = df_payment[~df_payment["_payment_row_id"].isin(matched_p
 
 # 丢掉内部中间字段
 proposal_internal_columns = ["_proposal_row_id", "_client_match_key", "_amount_cents"]
-payment_internal_columns = ["_payment_row_id", "_client_match_key", "_amount_cents"]
+payment_internal_columns = [
+    "_payment_row_id",
+    "_client_match_key",
+    "_amount_cents",
+    "_clean_processing_date",
+    "_date_sort_key",
+]
 
 for c in [c for c in proposal_internal_columns if c in df_proposal.columns]:
     df_proposal = df_proposal.drop(columns=[c])
@@ -540,6 +587,7 @@ if not ENABLE_DEBUG_DIAGNOSTICS:
         "_debug_payment_raw_name",
         "_debug_proposal_client_key",
         "_debug_payment_client_key",
+        "_debug_payment_date",
     ]
     for col in diag_cols:
         if col in df_proposal.columns:
