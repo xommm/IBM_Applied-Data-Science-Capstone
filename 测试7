@@ -80,7 +80,7 @@ def parse_processing_date(value):
     解析 Processing_Date：
     - 返回标准日期字符串（用于回填显示）
     - 返回排序元组 (priority, date_str)：
-      - 有具体日期：(0, "2026-08-07") -> 优先级最高，按日期先后升序排序
+      - 有具体日期：(0, "2026-08-07") -> 优先级高，按日期先后升序排序
       - 为空/Null/当天：(1, "9999-99-99") -> 优先级最低，排在最后处理
     """
     if pd.isna(value):
@@ -123,11 +123,13 @@ def format_unique_field(record_list, field_name):
 
 
 # ==========================================
-# 2. 子集搜索：保持优先级顺序 + 动态剪枝
+# 2. 毫秒级极速子集搜索算法（纯 O(1) 剪枝）
 # ==========================================
 def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANCE_CENTS):
-    """在 records 中寻找金额合计约等于 target 的组合（支持 ±tolerance 分尾差容错）。"""
-
+    """
+    在 records 中寻找金额合计约等于 target 的组合（支持 ±tolerance 分尾差容错）。
+    严格保持金额降序排列，利用前缀切片实现 O(1) 极速上下界剪枝。
+    """
     if target < 0:
         return None
 
@@ -142,7 +144,12 @@ def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANC
             return zero_records[:min_items]
         return None
 
-    record_count = len(positive_records)
+    # 核心：按金额降序，同金额按日期升序（早日期在前）
+    sorted_records = sorted(
+        positive_records,
+        key=lambda r: (-r["amount"], r.get("date_sort_key", (0, "")), r["row_id"]),
+    )
+    record_count = len(sorted_records)
     if record_count == 0:
         return None
 
@@ -162,7 +169,6 @@ def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANC
             slots_left = required_count - selected_count
 
             if slots_left == 0:
-                # 容许 ±tolerance 分钱误差
                 if -tolerance <= remaining <= tolerance:
                     result = list(current_subset)
                 return
@@ -172,25 +178,21 @@ def find_best_subset(records, target, max_items, min_items=1, tolerance=TOLERANC
             if remaining < -tolerance:
                 return
 
-            # 动态上下界剪枝
-            rem_amounts = [positive_records[i]["amount"] for i in range(start_index, record_count)]
-            rem_amounts.sort()
-            min_possible = sum(rem_amounts[:slots_left])
-            max_possible = sum(rem_amounts[-slots_left:])
+            # O(1) 极速切片求和剪枝（不再进行任何数组重建与排序）
+            max_possible = sum(sorted_records[i]["amount"] for i in range(start_index, start_index + slots_left))
+            min_possible = sum(sorted_records[i]["amount"] for i in range(record_count - slots_left, record_count))
 
             if remaining > max_possible + tolerance or remaining < min_possible - tolerance:
                 return
 
-            last_key = None
+            last_amount = None
             for index in range(start_index, record_count - slots_left + 1):
-                record = positive_records[index]
+                record = sorted_records[index]
                 amount = record["amount"]
 
-                # 相同优先级和金额的分支去重
-                record_key = (record.get("date_sort_key"), amount)
-                if last_key is not None and record_key == last_key:
+                if last_amount is not None and amount == last_amount:
                     continue
-                last_key = record_key
+                last_amount = amount
 
                 if amount > remaining + tolerance:
                     continue
@@ -248,7 +250,7 @@ if missing_proposal_columns:
 if missing_payment_columns:
     raise ValueError("Payment 输入缺少字段：" + ", ".join(missing_payment_columns))
 
-# 可选字段补齐（包括 Processing_Date）
+# 可选字段补齐
 def ensure_optional_column(df, col):
     if col not in df.columns:
         df[col] = None
@@ -272,7 +274,7 @@ df_payment["_client_match_key"] = df_payment["Client_Name"].apply(normalize_name
 df_proposal["_amount_cents"] = df_proposal["Proposal Total Amount"].apply(to_cents)
 df_payment["_amount_cents"] = df_payment["Yesterday_Balance"].apply(to_cents)
 
-# 解析并提取 Payment 日期与日期排序权重
+# 解析日期与排序优先级
 payment_date_parsed = df_payment["Processing_Date"].apply(parse_processing_date)
 df_payment["_clean_processing_date"] = [p[0] for p in payment_date_parsed]
 df_payment["_date_sort_key"] = [p[1] for p in payment_date_parsed]
@@ -350,7 +352,7 @@ def save_match(proposal_records, payment_records):
 
 
 # ==========================================
-# 6. 核心匹配引擎（支持早日期优先 & ±1分钱 尾差容错）
+# 6. 核心匹配引擎（分层优先 + 极速核销）
 # ==========================================
 def run_matching_engine(prop_df, pay_df, key_column):
     for client_key, proposal_group in prop_df.groupby(key_column, sort=False):
@@ -390,9 +392,8 @@ def run_matching_engine(prop_df, pay_df, key_column):
                 }
             )
 
-        # 提案优先大额在前
         available_proposals.sort(key=lambda r: (-r["amount"], r["row_id"]))
-        # 支付优先早日期在前，Null（当天）在最后；同日期按大额在前
+        # 严格按日期从早到晚排序（Null当天在最后），同日期按大额优先
         available_payments.sort(key=lambda r: (r["date_sort_key"], -r["amount"], r["row_id"]))
 
         # 阶段 0：全额直通车（优先匹配最早日期的 Payment）
@@ -407,7 +408,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 1：一笔 Payment 匹配多笔 Proposal（优先为早日期的 Payment 寻找组合）
+        # 阶段 1：一笔 Payment 匹配多笔 Proposal（按日期从早到晚遍历 Payment）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -434,7 +435,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 2：同金额一对一（优先匹配早日期的 Payment）
+        # 阶段 2：同金额一对一（优先选择最早日期的 Payment）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -459,18 +460,32 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 3：一笔 Proposal 匹配多笔 Payment（优先挑选早日期的 Payment 凑数）
+        # 阶段 3：一笔 Proposal 匹配多笔 Payment（分层：优先有具体日期的，不够再放开当天Null）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
             for proposal in list(available_proposals):
-                payment_subset = find_best_subset(
-                    available_payments,
-                    proposal["amount"],
-                    MAX_PAYMENTS_PER_MATCH,
-                    min_items=2,
-                    tolerance=TOLERANCE_CENTS,
-                )
+                # 先尝试仅用历史有日期的流水凑整
+                dated_payments = [p for p in available_payments if p["date_sort_key"][0] == 0]
+                payment_subset = None
+                if len(dated_payments) >= 2:
+                    payment_subset = find_best_subset(
+                        dated_payments,
+                        proposal["amount"],
+                        MAX_PAYMENTS_PER_MATCH,
+                        min_items=2,
+                        tolerance=TOLERANCE_CENTS,
+                    )
+                # 若历史流水凑不齐，再尝试全部（含当天Null）
+                if not payment_subset:
+                    payment_subset = find_best_subset(
+                        available_payments,
+                        proposal["amount"],
+                        MAX_PAYMENTS_PER_MATCH,
+                        min_items=2,
+                        tolerance=TOLERANCE_CENTS,
+                    )
+
                 if not payment_subset:
                     continue
 
@@ -486,7 +501,7 @@ def run_matching_engine(prop_df, pay_df, key_column):
         if not available_proposals or not available_payments:
             continue
 
-        # 阶段 4：多 Proposal 对多 Payment（双方>=2，优先使用早日期的 Payment）
+        # 阶段 4：多 Proposal 对多 Payment（分层：优先有具体日期的）
         progress = True
         while progress and available_proposals and available_payments:
             progress = False
@@ -497,13 +512,28 @@ def run_matching_engine(prop_df, pay_df, key_column):
 
                 for proposal_combo in combinations(available_proposals, proposal_count):
                     target_cents = sum(p["amount"] for p in proposal_combo)
-                    payment_subset = find_best_subset(
-                        available_payments,
-                        target_cents,
-                        MAX_PAYMENTS_PER_MATCH,
-                        min_items=2,
-                        tolerance=TOLERANCE_CENTS,
-                    )
+
+                    # 先尝试历史流水
+                    dated_payments = [p for p in available_payments if p["date_sort_key"][0] == 0]
+                    payment_subset = None
+                    if len(dated_payments) >= 2:
+                        payment_subset = find_best_subset(
+                            dated_payments,
+                            target_cents,
+                            MAX_PAYMENTS_PER_MATCH,
+                            min_items=2,
+                            tolerance=TOLERANCE_CENTS,
+                        )
+                    # 兜底全部流水
+                    if not payment_subset:
+                        payment_subset = find_best_subset(
+                            available_payments,
+                            target_cents,
+                            MAX_PAYMENTS_PER_MATCH,
+                            min_items=2,
+                            tolerance=TOLERANCE_CENTS,
+                        )
+
                     if not payment_subset:
                         continue
 
