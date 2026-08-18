@@ -1,21 +1,26 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
 set "folder=%~dp0"
+
+echo Using folder: "%folder%"
+echo Press Enter to start...
+pause
+
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-"$folder = '%folder%';" ^
-+ "Write-Host 'Folder=' $folder;" ^
-+ "$excel = New-Object -ComObject Excel.Application;" ^
-+ "$$ZXhjZWwuVmlzaWJsZSA9IA==$$false; $excel.DisplayAlerts = $false;" ^
-+ "Get-ChildItem -Path $$Zm9sZGVyIC1GaWx0ZXIgKi54bHMgfCBGb3JFYWNoLU9iamVjdCB7ICIgXgorICIgIA==$$xlsPath = $_.FullName; " ^
-+ "  $xlsxPath = [System.IO.Path]::ChangeExtension($xlsPath,'xlsx'); " ^
-+ "  if (!(Test-Path $xlsxPath)) { " ^
-+ "    $$d29ya2Jvb2sgPSA=$$excel.Workbooks.Open($xlsPath); " ^
-+ "    $workbook.SaveAs($xlsxPath, 51); " ^
-+ "    $workbook.Close(); " ^
-+ "    Write-Host ('转换完成: ' + $_.Name); " ^
-+ "  } else { Write-Host ('已存在，跳过: ' + $_.Name); } " ^
-+ "};" ^
-+ "$excel.Quit();"
+"$folder = '%folder%';"^
+"+ if(-not (Test-Path $folder)){ throw 'Folder not found: ' + $folder };"^
+"+ $excel = New-Object -ComObject Excel.Application;"^
+"+ $$ZXhjZWwuVmlzaWJsZSA9IA==$$false;"^
+"+ $excel.DisplayAlerts = $false;"^
+"+ Get-ChildItem -Path $$Zm9sZGVyIC1GaWx0ZXIgKi54bHMgfCBGb3JFYWNoLU9iamVjdCB7ICIgXgoiICAg$$xlsPath = $_.FullName; " ^
+"   $xlsxPath = [System.IO.Path]::ChangeExtension($xlsPath,'xlsx'); " ^
+"   if(Test-Path $xlsxPath){ Write-Host ('已存在，跳过: ' + $_.Name); return; } " ^
+"   $$d29ya2Jvb2sgPSA=$$excel.Workbooks.Open($xlsPath); " ^
+"   $workbook.SaveAs($xlsxPath, 51); " ^
+"   $workbook.Close(); " ^
+"   Write-Host ('转换完成: ' + $_.Name); " ^
+" };"^
+"+ $excel.Quit();"
 
 pause
