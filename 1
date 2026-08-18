@@ -1,13 +1,39 @@
-@echo off
-setlocal
+Option Explicit
 
-set "folder=%~dp0"
-echo Using folder: "%folder%"
-echo Listing xls files...
+Sub ConvertSelectedXlsToXlsx()
+    Dim f As Variant
+    Dim wb As Workbook
+    Dim savePath As String
+    Dim baseName As String
 
-powershell -NoProfile -Command ^
-" $folder = '%folder%'; " ^
-"+ Get-ChildItem -Path $folder -Filter '*.xls' | Select-Object -First 5 FullName | ForEach-Object { $_.ToString() }; " ^
-"+ Get-ChildItem -Path $folder -Filter '*.xls' | Measure-Object | ForEach-Object { 'Count=' + $_.Count } ; "
+    'Assumes files will be selected in the dialog
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .AllowMultiSelect = True
+        .Filters.Clear
+        .Filters.Add "Excel 97-2003", "*.xls"
+        .Title = "Select .xls files to convert"
+        If .Show <> -1 Then Exit Sub
+        'Multiple selections
+        For Each f In .SelectedItems
+            Set wb = Workbooks.Open(Filename:=CStr(f), ReadOnly:=False)
 
-pause
+            baseName = Left$(wb.Name, InStrRev(wb.Name, ".") - 1)
+            savePath = wb.Path & "\" & baseName & ".xlsx"
+
+            'Skip if exists (change to overwrite if you want)
+            If Dir(savePath) = "" Then
+                wb.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
+            Else
+                'Optional: overwrite
+                'wb.Delete savePath  'not reliable in all setups
+                wb.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
+            End If
+
+            wb.Close SaveChanges:=False
+        Next f
+    End With
+
+    MsgBox "Conversion finished.", vbInformation
+End Sub
