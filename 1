@@ -1,39 +1,40 @@
 Option Explicit
 
+Sub StartConvert()
+    ConvertSelectedXlsToXlsx
+End Sub
+
 Sub ConvertSelectedXlsToXlsx()
     Dim f As Variant
     Dim wb As Workbook
     Dim savePath As String
     Dim baseName As String
 
-    'Assumes files will be selected in the dialog
     Dim fd As FileDialog
     Set fd = Application.FileDialog(msoFileDialogFilePicker)
+
     With fd
         .AllowMultiSelect = True
         .Filters.Clear
         .Filters.Add "Excel 97-2003", "*.xls"
         .Title = "Select .xls files to convert"
         If .Show <> -1 Then Exit Sub
-        'Multiple selections
+
+        Application.ScreenUpdating = False
+        Application.DisplayAlerts = False
+
         For Each f In .SelectedItems
             Set wb = Workbooks.Open(Filename:=CStr(f), ReadOnly:=False)
 
             baseName = Left$(wb.Name, InStrRev(wb.Name, ".") - 1)
             savePath = wb.Path & "\" & baseName & ".xlsx"
 
-            'Skip if exists (change to overwrite if you want)
-            If Dir(savePath) = "" Then
-                wb.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
-            Else
-                'Optional: overwrite
-                'wb.Delete savePath  'not reliable in all setups
-                wb.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
-            End If
-
+            wb.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
             wb.Close SaveChanges:=False
         Next f
     End With
 
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
     MsgBox "Conversion finished.", vbInformation
 End Sub
