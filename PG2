@@ -4,42 +4,51 @@ import numpy as np
 from itertools import combinations
 
 # 1. 读取输入数据
-# #1: Proposal 数据
-# #2: Payment 数据
-df1 = Alteryx.read("#1")
-df2 = Alteryx.read("#2")
+# Anchor #1 -> Payment 数据（含 Drawee (Local), Payment Net Amount, Payment Group Reference）
+# Anchor #2 -> Proposal 数据（含 First_Buyer Name (Local) / Internal Buyer Reference, Proposal Total Amount）
+df_payment = Alteryx.read("#1")
+df_proposal = Alteryx.read("#2")
 
-# 2. 文本清洗函数（解决全半角括号、空格导致匹配不上的问题）
+# 2. 文本清洗函数（自动解决中英文全半角括号及空格不一致问题）
 def clean_text(val):
     if pd.isna(val):
         return ""
     s = str(val).strip()
-    # 统一全角括号为半角括号，并压缩多余空格
     s = s.replace("（", "(").replace("）", ")")
     return " ".join(s.split())
 
-# ----------------- 字段匹配 Key 设置 -----------------
-# 注意：如果 df1 是 'Internal Buyer Reference' 或 'First_Buyer Name (Local)'
-# df2 如果是 'Drawee (Local)'，请确保两边对应的列名一致，或使用下面统一的 key 字段
-key_col_df1 = 'First_Buyer Name (Local)' if 'First_Buyer Name (Local)' in df1.columns else 'Internal Buyer Reference'
-key_col_df2 = 'Drawee (Local)' if 'Drawee (Local)' in df2.columns else 'Internal Buyer Reference'
+# ----------------- 智能匹配列名 -----------------
+def get_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    for c in candidates:
+        for col in df.columns:
+            if c.lower() in str(col).lower():
+                return col
+    return candidates[0]
 
-df1['Clean_Key'] = df1[key_col_df1].apply(clean_text)
-df2['Clean_Key'] = df2[key_col_df2].apply(clean_text)
+col_pay_key = get_col(df_payment, ['Drawee (Local)', 'Drawee', 'Buyer Name (Local)', 'Internal Buyer Reference'])
+col_pay_amt = get_col(df_payment, ['Payment Net Amount', 'Sum_Payment Net Amount', 'Net Amount', 'Amount'])
+col_pay_ref = get_col(df_payment, ['Payment Group Reference', 'Payment Reference', 'Reference'])
 
-# 转换金额列为数值型
-df1['Proposal Total Amount'] = pd.to_numeric(df1['Proposal Total Amount'], errors='coerce').fillna(0.0)
-df2['Payment Net Amount'] = pd.to_numeric(df2['Payment Net Amount'], errors='coerce').fillna(0.0)
+col_prop_key = get_col(df_proposal, ['First_Buyer Name (Local)', 'Buyer Name (Local)', 'Internal Buyer Reference', 'Buyer Name'])
+col_prop_amt = get_col(df_proposal, ['Sum_Proposal Total Amount', 'Proposal Total Amount', 'Total Amount', 'Amount'])
 
-# 初始化目标字段
-df1['Payment Group Reference'] = None
+# 生成清洗后的对比 Key
+df_payment['Clean_Key'] = df_payment[col_pay_key].apply(clean_text)
+df_proposal['Clean_Key'] = df_proposal[col_prop_key].apply(clean_text)
 
-# 通用子集求和匹配函数
+# 转换金额为浮点数
+df_payment['_AMT'] = pd.to_numeric(df_payment[col_pay_amt], errors='coerce').fillna(0.0)
+df_proposal['_AMT'] = pd.to_numeric(df_proposal[col_prop_amt], errors='coerce').fillna(0.0)
+
+# 在 Proposal 表中初始化目标字段
+df_proposal['Payment Group Reference'] = None
+
+# 子集求和函数
 def find_subset_match(items, target_amount, tolerance=0.01, max_comb=10):
-    """
-    items: [(index, amount, extra_data), ...]
-    target_amount: 目标金额
-    """
+    """items: [(index, amount, extra_data), ...]"""
     n = len(items)
     limit = min(n, max_comb)
     for r in range(2, limit + 1):
@@ -48,88 +57,85 @@ def find_subset_match(items, target_amount, tolerance=0.01, max_comb=10):
                 return list(combo)
     return None
 
-# 3. 按 Clean_Key 分组进行智能匹配
-for key, group1 in df1.groupby('Clean_Key'):
+# 3. 按买家/客户分组处理匹配
+for key, group_prop in df_proposal.groupby('Clean_Key'):
     if not key:
         continue
         
-    group2 = df2[df2['Clean_Key'] == key]
-    if group2.empty:
+    group_pay = df_payment[df_payment['Clean_Key'] == key]
+    if group_pay.empty:
         continue
         
-    unmatched_df1 = group1.copy()
-    unmatched_df2 = group2.copy()
+    unmatched_prop = group_prop.copy()
+    unmatched_pay = group_pay.copy()
     
     # ---------------- 场景 0: 整组总金额完全匹配 ----------------
-    sum1 = unmatched_df1['Proposal Total Amount'].sum()
-    sum2 = unmatched_df2['Payment Net Amount'].sum()
+    sum_prop = unmatched_prop['_AMT'].sum()
+    sum_pay = unmatched_pay['_AMT'].sum()
     
-    if abs(sum1 - sum2) <= 0.01 and sum1 > 0:
-        if len(unmatched_df2) == 1:
-            # 1 笔 Payment 覆盖组内全部 Proposal
-            pay_ref = str(unmatched_df2.iloc[0]['Payment Group Reference'])
-            df1.loc[unmatched_df1.index, 'Payment Group Reference'] = pay_ref
+    if abs(sum_prop - sum_pay) <= 0.01 and sum_prop > 0:
+        if len(unmatched_pay) == 1:
+            # 1 笔 Payment 对应全组多笔 Proposal
+            pay_ref = str(unmatched_pay.iloc[0][col_pay_ref])
+            df_proposal.loc[unmatched_prop.index, 'Payment Group Reference'] = pay_ref
             continue
-        elif len(unmatched_df1) == 1:
-            # 赛诺菲场景：多笔 Payment 刚好凑成 1 笔 Proposal
-            all_refs = unmatched_df2['Payment Group Reference'].dropna().astype(str).unique()
-            df1.loc[unmatched_df1.index, 'Payment Group Reference'] = ", ".join(all_refs)
+        elif len(unmatched_prop) == 1:
+            # 赛诺菲场景：多笔 Payment 凑成 1 笔 Proposal
+            all_refs = unmatched_pay[col_pay_ref].dropna().astype(str).unique()
+            df_proposal.loc[unmatched_prop.index, 'Payment Group Reference'] = ", ".join(all_refs)
             continue
 
-    # ---------------- 步骤 1: 1对1 精确金额匹配 ----------------
-    matched_df2_indices = []
-    for idx2, row2 in unmatched_df2.iterrows():
-        target_amt = row2['Payment Net Amount']
-        pay_ref = str(row2['Payment Group Reference'])
+    # ---------------- 步骤 1: 1 对 1 精确金额匹配 ----------------
+    matched_pay_indices = []
+    for idx_p, row_p in unmatched_pay.iterrows():
+        target_amt = row_p['_AMT']
+        pay_ref = str(row_p[col_pay_ref])
         
-        matches_1v1 = unmatched_df1[np.isclose(unmatched_df1['Proposal Total Amount'], target_amt, atol=0.01)]
+        matches_1v1 = unmatched_prop[np.isclose(unmatched_prop['_AMT'], target_amt, atol=0.01)]
         if not matches_1v1.empty:
-            matched_idx1 = matches_1v1.index[0]
-            df1.loc[matched_idx1, 'Payment Group Reference'] = pay_ref
-            unmatched_df1 = unmatched_df1.drop(matched_idx1)
-            matched_df2_indices.append(idx2)
+            matched_idx_prop = matches_1v1.index[0]
+            df_proposal.loc[matched_idx_prop, 'Payment Group Reference'] = pay_ref
+            unmatched_prop = unmatched_prop.drop(matched_idx_prop)
+            matched_pay_indices.append(idx_p)
             
-    unmatched_df2 = unmatched_df2.drop(matched_df2_indices)
+    unmatched_pay = unmatched_pay.drop(matched_pay_indices)
 
-    # ---------------- 步骤 2: 1对多匹配 (1 笔 Payment == 多笔 Proposal 之和) ----------------
-    matched_df2_indices = []
-    for idx2, row2 in unmatched_df2.iterrows():
-        if unmatched_df1.empty:
+    # ---------------- 步骤 2: 1 笔 Payment == 多笔 Proposal 之和 ----------------
+    matched_pay_indices = []
+    for idx_p, row_p in unmatched_pay.iterrows():
+        if unmatched_prop.empty:
             break
-        target_amt = row2['Payment Net Amount']
-        pay_ref = str(row2['Payment Group Reference'])
+        target_amt = row_p['_AMT']
+        pay_ref = str(row_p[col_pay_ref])
         
-        proposal_items = [(idx1, row1['Proposal Total Amount']) 
-                          for idx1, row1 in unmatched_df1.iterrows() if row1['Proposal Total Amount'] > 0]
-        
+        proposal_items = [(idx, row['_AMT']) for idx, row in unmatched_prop.iterrows() if row['_AMT'] > 0]
         subset = find_subset_match(proposal_items, target_amt)
         if subset:
-            matched_idx1_list = [item[0] for item in subset]
-            df1.loc[matched_idx1_list, 'Payment Group Reference'] = pay_ref
-            unmatched_df1 = unmatched_df1.drop(matched_idx1_list)
-            matched_df2_indices.append(idx2)
+            matched_prop_idx_list = [item[0] for item in subset]
+            df_proposal.loc[matched_prop_idx_list, 'Payment Group Reference'] = pay_ref
+            unmatched_prop = unmatched_prop.drop(matched_prop_idx_list)
+            matched_pay_indices.append(idx_p)
             
-    unmatched_df2 = unmatched_df2.drop(matched_df2_indices)
+    unmatched_pay = unmatched_pay.drop(matched_pay_indices)
 
-    # ---------------- 步骤 3: 多对1匹配 (1 笔 Proposal == 多笔 Payment 之和) ----------------
-    for idx1, row1 in unmatched_df1.iterrows():
-        if unmatched_df2.empty:
+    # ---------------- 步骤 3: 1 笔 Proposal == 多笔 Payment 之和（赛诺菲等分批付款） ----------------
+    for idx_prop, row_prop in unmatched_prop.iterrows():
+        if unmatched_pay.empty:
             break
-        target_amt = row1['Proposal Total Amount']
+        target_amt = row_prop['_AMT']
         
-        payment_items = [(idx2, row2['Payment Net Amount'], str(row2['Payment Group Reference'])) 
-                         for idx2, row2 in unmatched_df2.iterrows() if row2['Payment Net Amount'] > 0]
+        payment_items = [(idx_p, row_p['_AMT'], str(row_p[col_pay_ref])) 
+                         for idx_p, row_p in unmatched_pay.iterrows() if row_p['_AMT'] > 0]
         
         subset = find_subset_match(payment_items, target_amt)
         if subset:
-            matched_idx2_list = [item[0] for item in subset]
-            # 提取匹配到的所有 Payment Group Reference 并拼接
+            matched_pay_idx_list = [item[0] for item in subset]
             matched_refs = list(dict.fromkeys([item[2] for item in subset if item[2] not in ['None', 'nan', '']]))
             combined_ref = ", ".join(matched_refs)
             
-            df1.loc[idx1, 'Payment Group Reference'] = combined_ref
-            unmatched_df2 = unmatched_df2.drop(matched_idx2_list)
+            df_proposal.loc[idx_prop, 'Payment Group Reference'] = combined_ref
+            unmatched_pay = unmatched_pay.drop(matched_pay_idx_list)
 
-# 4. 删除临时生成的清洗列并写出结果
-df1 = df1.drop(columns=['Clean_Key'])
-Alteryx.write(df1, 1)
+# 4. 清理临时字段并输出 Proposal 表到 1 号输出端口
+df_proposal = df_proposal.drop(columns=['Clean_Key', '_AMT'])
+Alteryx.write(df_proposal, 1)
