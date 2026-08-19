@@ -10,7 +10,7 @@ from collections import defaultdict
 df_payment = Alteryx.read("#1")
 df_proposal = Alteryx.read("#2")
 
-# 2. 辅助与文本清洗函数（自动解决全半角括号与空格问题）
+# 2. 辅助与文本清洗函数
 def clean_text(val):
     if pd.isna(val):
         return ""
@@ -43,10 +43,8 @@ df_proposal['Clean_Key'] = df_proposal[col_prop_key].apply(clean_text)
 df_payment['_AMT'] = pd.to_numeric(df_payment[col_pay_amt], errors='coerce').fillna(0.0)
 df_proposal['_AMT'] = pd.to_numeric(df_proposal[col_prop_amt], errors='coerce').fillna(0.0)
 
-# 跟踪匹配状态
-# proposal_matches: { proposal_idx: [ref1, ref2, ...] }
+# 存储匹配信息
 proposal_matches = defaultdict(list)
-# matched_pay_indices: 存储成功匹配掉的 payment 表行索引集合
 matched_pay_indices = set()
 
 # 子集求和函数
@@ -59,7 +57,7 @@ def find_subset_match(items, target_amount, tolerance=0.01, max_comb=10):
                 return list(combo)
     return None
 
-# 3. 按买家/客户分组智能匹配
+# 3. 分组智能匹配
 for key, group_prop in df_proposal.groupby('Clean_Key'):
     if not key:
         continue
@@ -77,7 +75,6 @@ for key, group_prop in df_proposal.groupby('Clean_Key'):
     
     if abs(sum_prop - sum_pay) <= 0.01 and sum_prop > 0:
         if len(unmatched_pay) == 1:
-            # 1 笔 Payment 对应多笔 Proposal
             pay_idx = unmatched_pay.index[0]
             pay_ref = str(unmatched_pay.iloc[0][col_pay_ref])
             for idx in unmatched_prop.index:
@@ -85,7 +82,6 @@ for key, group_prop in df_proposal.groupby('Clean_Key'):
             matched_pay_indices.add(pay_idx)
             continue
         elif len(unmatched_prop) == 1:
-            # 赛诺菲场景: 多笔 Payment 凑成 1 笔 Proposal
             idx = unmatched_prop.index[0]
             for p_idx, p_row in unmatched_pay.iterrows():
                 ref_val = p_row[col_pay_ref]
@@ -149,9 +145,9 @@ for key, group_prop in df_proposal.groupby('Clean_Key'):
                 matched_pay_indices.add(item[0])
             unmatched_pay = unmatched_pay.drop(matched_p_indices)
 
-# 4. 构建并写出两个端口的输出
+# 4. 构建并写出输出
 
-# ---------- 端口 1: 匹配成功的 Proposal (已挂单号，多单号已拆行复制) ----------
+# ---------- 端口 1: 匹配成功的 Proposal ----------
 base_prop = df_proposal.drop(columns=['Clean_Key', '_AMT']).copy()
 matched_rows = []
 
@@ -169,9 +165,16 @@ else:
     df_matched = base_prop.iloc[0:0].copy()
     df_matched['Payment Group Reference'] = None
 
+# 【核心重命名】：将买家名称重命名为 Drawee (Local)，金额列重命名为 Payment Net Amount
+rename_map = {
+    col_prop_key: 'Drawee (Local)',
+    col_prop_amt: 'Payment Net Amount'
+}
+df_matched = df_matched.rename(columns=rename_map)
+
 Alteryx.write(df_matched, 1)
 
-# ---------- 端口 2: 未匹配上的 Payment 原始记录 (未消掉的单号) ----------
+# ---------- 端口 2: 未匹配上的 Payment 原始记录 ----------
 base_pay = df_payment.drop(columns=['Clean_Key', '_AMT']).copy()
 unmatched_pay_idx = [i for i in base_pay.index if i not in matched_pay_indices]
 df_unmatched_payment = base_pay.loc[unmatched_pay_idx].copy().reset_index(drop=True)
