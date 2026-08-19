@@ -2,22 +2,30 @@ from ayx import Alteryx
 import pandas as pd
 import numpy as np
 from itertools import combinations
-from collections import defaultdict
 
 # 1. 读取输入数据
-# #1 -> Payment 表
-# #2 -> Proposal 表
+# #1 -> Payment 表（主体表）
+# #2 -> Proposal 表（参考匹配表）
 df_payment = Alteryx.read("#1")
 df_proposal = Alteryx.read("#2")
 
-# 2. 辅助与文本清洗函数
+# 2. 强力文本与金额清洗函数
 def clean_text(val):
     if pd.isna(val):
         return ""
     s = str(val).strip()
+    if s.endswith('.0'):
+        s = s[:-2]
+    # 统一全角/半角括号及空格
     s = s.replace("（", "(").replace("）", ")")
-    return " ".join(s.split())
+    return " ".join(s.split()).upper()
 
+def clean_amount(series):
+    s = series.astype(str).str.replace(',', '', regex=False)
+    s = s.str.replace('¥', '', regex=False).str.replace('$', '', regex=False).str.strip()
+    return pd.to_numeric(s, errors='coerce').fillna(0.0)
+
+# 动态智能定位列名
 def get_col(df, candidates):
     for c in candidates:
         if c in df.columns:
@@ -28,155 +36,131 @@ def get_col(df, candidates):
                 return col
     return candidates[0]
 
-# 自动定位列名
-col_pay_key = get_col(df_payment, ['Drawee (Local)', 'Drawee', 'Buyer Name (Local)', 'Internal Buyer Reference'])
-col_pay_amt = get_col(df_payment, ['Payment Net Amount', 'Sum_Payment Net Amount', 'Net Amount', 'Amount'])
-col_pay_ref = get_col(df_payment, ['Payment Group Reference', 'Payment Reference', 'Reference'])
+# 定位关键列
+col_pay_name = get_col(df_payment, ['Drawee (Local)', 'Drawee', 'Buyer Name (Local)', 'Buyer Name'])
+col_pay_amt  = get_col(df_payment, ['Payment Net Amount', 'Sum_Payment Net Amount', 'Net Amount', 'Amount'])
+col_pay_ref  = get_col(df_payment, ['Payment Group Reference', 'Payment Reference', 'Reference'])
 
-col_prop_key = get_col(df_proposal, ['First_Buyer Name (Local)', 'Buyer Name (Local)', 'Internal Buyer Reference', 'Buyer Name'])
-col_prop_amt = get_col(df_proposal, ['Sum_Proposal Total Amount', 'Proposal Total Amount', 'Total Amount', 'Amount'])
+col_prop_name = get_col(df_proposal, ['First_Buyer Name (Local)', 'Buyer Name (Local)', 'Drawee (Local)', 'Buyer Name'])
+col_prop_amt  = get_col(df_proposal, ['Sum_Proposal Total Amount', 'Proposal Total Amount', 'Amount'])
+col_prop_ref  = get_col(df_proposal, ['Internal Buyer Reference', 'Buyer Reference', 'Buyer Code'])
 
 # 数据预处理
-df_payment['Clean_Key'] = df_payment[col_pay_key].apply(clean_text)
-df_proposal['Clean_Key'] = df_proposal[col_prop_key].apply(clean_text)
+df_payment['Clean_Key'] = df_payment[col_pay_name].apply(clean_text)
+df_proposal['Clean_Key'] = df_proposal[col_prop_name].apply(clean_text)
 
-df_payment['_AMT'] = pd.to_numeric(df_payment[col_pay_amt], errors='coerce').fillna(0.0)
-df_proposal['_AMT'] = pd.to_numeric(df_proposal[col_prop_amt], errors='coerce').fillna(0.0)
+df_payment['_AMT'] = clean_amount(df_payment[col_pay_amt])
+df_proposal['_AMT'] = clean_amount(df_proposal[col_prop_amt])
 
-# 存储匹配信息
-proposal_matches = defaultdict(list)
+# 初始化目标字段：在 Payment 表中悬挂 Internal Buyer Reference
+df_payment['Internal Buyer Reference'] = None
+
+# 记录成功匹配的 payment 行索引
 matched_pay_indices = set()
 
-# 子集求和函数
-def find_subset_match(items, target_amount, tolerance=0.01, max_comb=10):
+# 通用子集求和
+def find_subset_sum(items, target_amt, tol=0.02, max_k=15):
     n = len(items)
-    limit = min(n, max_comb)
-    for r in range(2, limit + 1):
+    for r in range(2, min(n, max_k) + 1):
         for combo in combinations(items, r):
-            if abs(sum(x[1] for x in combo) - target_amount) <= tolerance:
-                return list(combo)
+            if abs(sum(x[1] for x in combo) - target_amt) <= tol:
+                return [x[0] for x in combo]
     return None
 
-# 3. 分组智能匹配
-for key, group_prop in df_proposal.groupby('Clean_Key'):
+# 3. 按买家名称分组匹配
+for key, group_pay in df_payment.groupby('Clean_Key'):
     if not key:
         continue
         
-    group_pay = df_payment[df_payment['Clean_Key'] == key]
-    if group_pay.empty:
+    group_prop = df_proposal[df_proposal['Clean_Key'] == key]
+    if group_prop.empty:
         continue
         
-    unmatched_prop = group_prop.copy()
+    # 获取该买家对应的 Internal Buyer Reference (如 9999)
+    prop_refs = list(dict.fromkeys(group_prop[col_prop_ref].dropna().astype(str).tolist()))
+    buyer_ref_str = ", ".join(prop_refs) if prop_refs else str(key)
+    
     unmatched_pay = group_pay.copy()
+    unmatched_prop = group_prop.copy()
     
-    # ---------------- 场景 0: 整组总金额完全匹配 ----------------
-    sum_prop = unmatched_prop['_AMT'].sum()
     sum_pay = unmatched_pay['_AMT'].sum()
+    sum_prop = unmatched_prop['_AMT'].sum()
     
-    if abs(sum_prop - sum_pay) <= 0.01 and sum_prop > 0:
-        if len(unmatched_pay) == 1:
-            pay_idx = unmatched_pay.index[0]
-            pay_ref = str(unmatched_pay.iloc[0][col_pay_ref])
-            for idx in unmatched_prop.index:
-                proposal_matches[idx].append(pay_ref)
-            matched_pay_indices.add(pay_idx)
-            continue
-        elif len(unmatched_prop) == 1:
-            idx = unmatched_prop.index[0]
-            for p_idx, p_row in unmatched_pay.iterrows():
-                ref_val = p_row[col_pay_ref]
-                if pd.notna(ref_val) and str(ref_val).strip() != '':
-                    proposal_matches[idx].append(str(ref_val))
-                matched_pay_indices.add(p_idx)
-            continue
+    # ---------------- 场景 0: 快速全量匹配（赛诺菲等整组对齐场景） ----------------
+    # 只要买家总额对得上，或者单笔金额与提报总额相等，该买家下的所有付款单全部挂上该 Reference
+    if abs(sum_pay - sum_prop) <= 0.05 or any(abs(row_q['_AMT'] - sum_prop) <= 0.05 for _, row_q in unmatched_pay.iterrows()):
+        for idx_q in unmatched_pay.index:
+            df_payment.loc[idx_q, 'Internal Buyer Reference'] = buyer_ref_str
+            matched_pay_indices.add(idx_q)
+        continue
 
     # ---------------- 步骤 1: 1 对 1 精确金额匹配 ----------------
-    matched_current_pay = []
-    for idx_p, row_p in unmatched_pay.iterrows():
-        target_amt = row_p['_AMT']
-        pay_ref = str(row_p[col_pay_ref])
-        
-        matches_1v1 = unmatched_prop[np.isclose(unmatched_prop['_AMT'], target_amt, atol=0.01)]
-        if not matches_1v1.empty:
-            matched_idx_prop = matches_1v1.index[0]
-            proposal_matches[matched_idx_prop].append(pay_ref)
-            matched_pay_indices.add(idx_p)
-            unmatched_prop = unmatched_prop.drop(matched_idx_prop)
-            matched_current_pay.append(idx_p)
+    matched_q_idx = []
+    for idx_q, row_q in unmatched_pay.iterrows():
+        target_amt = row_q['_AMT']
+        matches = unmatched_prop[np.isclose(unmatched_prop['_AMT'], target_amt, atol=0.02)]
+        if not matches.empty:
+            matched_idx_p = matches.index[0]
+            matched_buyer_ref = str(matches.loc[matched_idx_p, col_prop_ref])
+            df_payment.loc[idx_q, 'Internal Buyer Reference'] = matched_buyer_ref
+            matched_pay_indices.add(idx_q)
+            unmatched_prop = unmatched_prop.drop(matched_idx_p)
+            matched_q_idx.append(idx_q)
             
-    unmatched_pay = unmatched_pay.drop(matched_current_pay)
+    unmatched_pay = unmatched_pay.drop(matched_q_idx)
 
     # ---------------- 步骤 2: 1 笔 Payment == 多笔 Proposal 之和 ----------------
-    matched_current_pay = []
-    for idx_p, row_p in unmatched_pay.iterrows():
+    matched_q_idx = []
+    for idx_q, row_q in unmatched_pay.iterrows():
         if unmatched_prop.empty:
             break
-        target_amt = row_p['_AMT']
-        pay_ref = str(row_p[col_pay_ref])
+        target_amt = row_q['_AMT']
         
-        proposal_items = [(idx, row['_AMT']) for idx, row in unmatched_prop.iterrows() if row['_AMT'] > 0]
-        subset = find_subset_match(proposal_items, target_amt)
-        if subset:
-            for item in subset:
-                proposal_matches[item[0]].append(pay_ref)
-            matched_pay_indices.add(idx_p)
-            matched_prop_idx_list = [item[0] for item in subset]
-            unmatched_prop = unmatched_prop.drop(matched_prop_idx_list)
-            matched_current_pay.append(idx_p)
+        # 剩余 Proposal 全量加和判断
+        if abs(unmatched_prop['_AMT'].sum() - target_amt) <= 0.05:
+            df_payment.loc[idx_q, 'Internal Buyer Reference'] = buyer_ref_str
+            matched_pay_indices.add(idx_q)
+            unmatched_prop = unmatched_prop.iloc[0:0]
+            matched_q_idx.append(idx_q)
+            break
             
-    unmatched_pay = unmatched_pay.drop(matched_current_pay)
+        p_items = [(idx, row['_AMT']) for idx, row in unmatched_prop.iterrows() if row['_AMT'] > 0]
+        subset = find_subset_sum(p_items, target_amt, tol=0.02)
+        if subset:
+            matched_refs = list(dict.fromkeys(unmatched_prop.loc[subset, col_prop_ref].dropna().astype(str).tolist()))
+            df_payment.loc[idx_q, 'Internal Buyer Reference'] = ", ".join(matched_refs) if matched_refs else buyer_ref_str
+            matched_pay_indices.add(idx_q)
+            unmatched_prop = unmatched_prop.drop(subset)
+            matched_q_idx.append(idx_q)
+            
+    unmatched_pay = unmatched_pay.drop(matched_q_idx)
 
     # ---------------- 步骤 3: 1 笔 Proposal == 多笔 Payment 之和 ----------------
-    for idx_prop, row_prop in unmatched_prop.iterrows():
+    for idx_p, row_p in unmatched_prop.iterrows():
         if unmatched_pay.empty:
             break
-        target_amt = row_prop['_AMT']
+        target_amt = row_p['_AMT']
+        matched_buyer_ref = str(row_p[col_prop_ref])
         
-        payment_items = [(idx_p, row_p['_AMT'], str(row_p[col_pay_ref])) 
-                         for idx_p, row_p in unmatched_pay.iterrows() if row_p['_AMT'] > 0]
-        
-        subset = find_subset_match(payment_items, target_amt)
+        q_items = [(idx, row['_AMT']) for idx, row in unmatched_pay.iterrows() if row['_AMT'] > 0]
+        subset = find_subset_sum(q_items, target_amt, tol=0.02)
         if subset:
-            matched_p_indices = [item[0] for item in subset]
-            for item in subset:
-                ref_val = item[2]
-                if ref_val not in ['None', 'nan', '']:
-                    proposal_matches[idx_prop].append(ref_val)
-                matched_pay_indices.add(item[0])
-            unmatched_pay = unmatched_pay.drop(matched_p_indices)
+            for idx_q in subset:
+                df_payment.loc[idx_q, 'Internal Buyer Reference'] = matched_buyer_ref
+                matched_pay_indices.add(idx_q)
+            unmatched_pay = unmatched_pay.drop(subset)
 
 # 4. 构建并写出输出
 
-# ---------- 端口 1: 匹配成功的 Proposal ----------
-base_prop = df_proposal.drop(columns=['Clean_Key', '_AMT']).copy()
-matched_rows = []
+# 纯净的 Payment 表数据
+base_payment = df_payment.drop(columns=['Clean_Key', '_AMT']).copy()
 
-for idx_prop, refs in proposal_matches.items():
-    if refs:
-        orig_row = base_prop.loc[idx_prop]
-        for ref in refs:
-            row_copy = orig_row.copy()
-            row_copy['Payment Group Reference'] = ref
-            matched_rows.append(row_copy)
-
-if matched_rows:
-    df_matched = pd.DataFrame(matched_rows).reset_index(drop=True)
-else:
-    df_matched = base_prop.iloc[0:0].copy()
-    df_matched['Payment Group Reference'] = None
-
-# 【核心重命名】：将买家名称重命名为 Drawee (Local)，金额列重命名为 Payment Net Amount
-rename_map = {
-    col_prop_key: 'Drawee (Local)',
-    col_prop_amt: 'Payment Net Amount'
-}
-df_matched = df_matched.rename(columns=rename_map)
-
+# ---------- 端口 1: 匹配成功的 Payment 记录 (已成功挂上 Internal Buyer Reference) ----------
+matched_idx_list = [i for i in base_payment.index if i in matched_pay_indices]
+df_matched = base_payment.loc[matched_idx_list].copy().reset_index(drop=True)
 Alteryx.write(df_matched, 1)
 
-# ---------- 端口 2: 未匹配上的 Payment 原始记录 ----------
-base_pay = df_payment.drop(columns=['Clean_Key', '_AMT']).copy()
-unmatched_pay_idx = [i for i in base_pay.index if i not in matched_pay_indices]
-df_unmatched_payment = base_pay.loc[unmatched_pay_idx].copy().reset_index(drop=True)
-
-Alteryx.write(df_unmatched_payment, 2)
+# ---------- 端口 2: 未能匹配上的 Payment 原始记录 (未找到买家/金额对不上) ----------
+unmatched_idx_list = [i for i in base_payment.index if i not in matched_pay_indices]
+df_unmatched = base_payment.loc[unmatched_idx_list].copy().reset_index(drop=True)
+Alteryx.write(df_unmatched, 2)
